@@ -10,6 +10,7 @@ import hashlib
 import ast
 import shutil
 import re
+import html
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -50,7 +51,7 @@ PRODUCT_IMAGE_DIR = os.path.join(BASE_DIR, "product_images")
 os.makedirs(PRODUCT_IMAGE_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "2.4.1"
+APP_VERSION = "2.5.0"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -395,6 +396,65 @@ h1, h2, h3 { letter-spacing: -0.02em; }
     letter-spacing: .08em;
     margin: .9rem 0 .32rem 0;
 }
+.pipeline-stage {
+    background: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    border-radius: 14px;
+    padding: 12px;
+    min-height: 160px;
+    margin-bottom: 14px;
+}
+.pipeline-stage-title {
+    font-size: .88rem;
+    font-weight: 800;
+    color: #0F172A;
+    margin-bottom: 2px;
+}
+.pipeline-stage-count {
+    font-size: .73rem;
+    color: #64748B;
+    margin-bottom: 10px;
+}
+.project-card {
+    background: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 12px;
+    padding: 11px 12px;
+    margin: 8px 0;
+    box-shadow: 0 1px 2px rgba(15,23,42,.04);
+}
+.project-card.high { border-left: 4px solid #EF4444; }
+.project-card.medium { border-left: 4px solid #F59E0B; }
+.project-card.low { border-left: 4px solid #94A3B8; }
+.project-name {
+    font-size: .88rem;
+    font-weight: 800;
+    color: #111827;
+    line-height: 1.3;
+}
+.project-client {
+    font-size: .75rem;
+    color: #64748B;
+    margin-top: 3px;
+}
+.project-action {
+    font-size: .78rem;
+    color: #334155;
+    margin-top: 8px;
+    line-height: 1.35;
+}
+.project-follow {
+    font-size: .72rem;
+    color: #2563EB;
+    margin-top: 7px;
+    font-weight: 700;
+}
+.empty-stage {
+    font-size: .75rem;
+    color: #94A3B8;
+    padding: 10px 2px 4px 2px;
+}
+
 .page-kicker { color: #64748B; font-size: .82rem; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
 .page-title { color: #0F172A; font-size: 2rem; line-height: 1.15; font-weight: 800; margin-top: .25rem; }
 .page-subtitle { color: #64748B; font-size: .95rem; margin-top: .35rem; margin-bottom: 1.25rem; }
@@ -685,7 +745,7 @@ if page == "🏗️  Công trình":
     with c4: kpi_card("📌", "CÓ VIỆC TIẾP THEO", follow_ct, "Đã có action")
 
     st.markdown("### 🎯 Bảng điều hành dự án")
-    st.caption("Tập trung vào Giai đoạn → Việc tiếp theo → Ngày theo dõi. Đây là màn hình làm việc chính cho các dự án.")
+    st.caption("Nhìn nhanh dự án đang ở đâu trong pipeline, việc tiếp theo là gì và khi nào cần follow-up.")
 
     df_ct_joined = pd.read_sql_query("""
         SELECT
@@ -706,29 +766,114 @@ if page == "🏗️  Công trình":
             c.id DESC
     """, conn)
 
-    f1, f2, f3 = st.columns([1.5, 1, 1])
-    with f1:
-        search_ct = st.text_input("🔎 Tìm công trình", placeholder="Tên dự án, chủ đầu tư, địa chỉ...", key="project_search")
-    with f2:
-        stage_options = ["Tất cả"] + sorted([x for x in df_ct_joined["giai_doan"].dropna().unique().tolist() if x])
-        stage_filter = st.selectbox("Giai đoạn", stage_options, key="project_stage_filter")
-    with f3:
-        priority_filter = st.selectbox("Ưu tiên", ["Tất cả", "High", "Medium", "Low"], key="project_priority_filter")
+    mode_col, search_col, priority_col = st.columns([1, 1.7, 1])
+    with mode_col:
+        view_mode = st.radio(
+            "Chế độ xem",
+            ["🧩 Pipeline", "📋 Danh sách"],
+            horizontal=True,
+            key="project_view_mode"
+        )
+    with search_col:
+        search_ct = st.text_input(
+            "🔎 Tìm công trình",
+            placeholder="Tên dự án, chủ đầu tư, địa chỉ...",
+            key="project_search"
+        )
+    with priority_col:
+        priority_filter = st.selectbox(
+            "Ưu tiên",
+            ["Tất cả", "High", "Medium", "Low"],
+            key="project_priority_filter"
+        )
 
-    view = df_ct_joined.copy()
+    base_view = df_ct_joined.copy()
     if search_ct.strip():
         q = search_ct.strip().lower()
-        mask = view.astype(str).apply(lambda col: col.str.lower().str.contains(q, na=False)).any(axis=1)
-        view = view[mask]
-    if stage_filter != "Tất cả":
-        view = view[view["giai_doan"] == stage_filter]
+        mask = base_view.astype(str).apply(
+            lambda col: col.str.lower().str.contains(q, na=False)
+        ).any(axis=1)
+        base_view = base_view[mask]
     if priority_filter != "Tất cả":
-        view = view[view["uu_tien"] == priority_filter]
+        base_view = base_view[base_view["uu_tien"] == priority_filter]
 
-    display_cols = ["id","ten_du_an","Chu_Dau_Tu","uu_tien","giai_doan","viec_tiep_theo","ngay_theo_doi"]
-    display = view[display_cols].copy()
-    display.columns = ["ID","Công trình","Khách hàng / CĐT","Ưu tiên","Giai đoạn","Việc tiếp theo","Ngày theo dõi"]
-    st.dataframe(display, width="stretch", hide_index=True)
+    stages = [
+        "Tiếp cận", "Khảo sát", "Báo giá", "Thương lượng",
+        "Chốt đơn", "Triển khai", "Hoàn thành", "Tạm dừng"
+    ]
+
+    if view_mode == "🧩 Pipeline":
+        # 8 giai đoạn chia thành 2 hàng x 4 cột để vẫn đọc được trên màn hình desktop.
+        for row_start in (0, 4):
+            stage_cols = st.columns(4)
+            for idx, stage in enumerate(stages[row_start:row_start + 4]):
+                stage_df = base_view[
+                    base_view["giai_doan"].fillna("").eq(stage)
+                ]
+                with stage_cols[idx]:
+                    st.markdown(
+                        f'<div class="pipeline-stage-title">{html.escape(stage)}</div>'
+                        f'<div class="pipeline-stage-count">{len(stage_df)} dự án</div>',
+                        unsafe_allow_html=True
+                    )
+
+                    if stage_df.empty:
+                        st.markdown(
+                            '<div class="pipeline-stage"><div class="empty-stage">Chưa có dự án</div></div>',
+                            unsafe_allow_html=True
+                        )
+                    else:
+                        cards = ['<div class="pipeline-stage">']
+                        for _, r in stage_df.iterrows():
+                            priority = str(r["uu_tien"] or "Medium")
+                            priority_class = priority.lower() if priority.lower() in ("high", "medium", "low") else "medium"
+                            name = html.escape(str(r["ten_du_an"] or ""))
+                            client = html.escape(str(r["Chu_Dau_Tu"] or "Chưa gắn khách hàng"))
+                            action = html.escape(str(r["viec_tiep_theo"] or "").strip())
+                            follow = html.escape(str(r["ngay_theo_doi"] or "").strip())
+
+                            action_html = (
+                                f'<div class="project-action">📌 {action}</div>'
+                                if action else
+                                '<div class="project-action" style="color:#94A3B8;">📌 Chưa có việc tiếp theo</div>'
+                            )
+                            follow_html = (
+                                f'<div class="project-follow">🗓 {follow}</div>'
+                                if follow else
+                                '<div class="project-follow" style="color:#94A3B8;">🗓 Chưa đặt ngày follow-up</div>'
+                            )
+                            cards.append(
+                                f'<div class="project-card {priority_class}">'
+                                f'<div class="project-name">{name}</div>'
+                                f'<div class="project-client">👤 {client} · {html.escape(priority)}</div>'
+                                f'{action_html}{follow_html}'
+                                f'</div>'
+                            )
+                        cards.append('</div>')
+                        st.markdown("".join(cards), unsafe_allow_html=True)
+
+    else:
+        list_filter_col, _ = st.columns([1, 2])
+        with list_filter_col:
+            stage_filter = st.selectbox(
+                "Lọc theo giai đoạn",
+                ["Tất cả"] + stages,
+                key="project_stage_filter"
+            )
+        view = base_view.copy()
+        if stage_filter != "Tất cả":
+            view = view[view["giai_doan"] == stage_filter]
+
+        display_cols = [
+            "id", "ten_du_an", "Chu_Dau_Tu", "uu_tien",
+            "giai_doan", "viec_tiep_theo", "ngay_theo_doi"
+        ]
+        display = view[display_cols].copy()
+        display.columns = [
+            "ID", "Công trình", "Khách hàng / CĐT", "Ưu tiên",
+            "Giai đoạn", "Việc tiếp theo", "Ngày theo dõi"
+        ]
+        st.dataframe(display, width="stretch", hide_index=True)
 
     st.markdown("---")
     action_col, create_col = st.columns(2)
