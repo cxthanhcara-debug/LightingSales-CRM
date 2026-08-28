@@ -1,5 +1,6 @@
 {
-  "version": "2.2.1",
+  "version": "2.3.0",
   "app_url": "https://raw.githubusercontent.com/cxthanhcara-debug/LightingSales-CRM/main/app.py",
-  "notes": "LightingSales CRM v2.2.1 - Auto Update"
+  "sha256": "9a92db43543fcbd20161d316760fcbcdd0bdb72dc156faa25b81410a52ca9c6f",
+  "notes": "LightingSales CRM v2.3.0 - Modern Business UI: sidebar navigation, modern dashboard, KPI cards and refreshed styling."
 }

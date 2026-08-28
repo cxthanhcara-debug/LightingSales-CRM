@@ -50,7 +50,7 @@ PRODUCT_IMAGE_DIR = os.path.join(BASE_DIR, "product_images")
 os.makedirs(PRODUCT_IMAGE_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "2.2"
+APP_VERSION = "2.3.0"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -308,152 +308,168 @@ def load_data():
 
 
 # ============================================================
-# 5. GIAO DIỆN
+# 5. GIAO DIỆN - MODERN BUSINESS CRM
 # ============================================================
 
 st.set_page_config(
     page_title="LightingSales CRM",
     page_icon="💡",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 st.markdown("""
 <style>
-
-.main-title {
-    color: #FF9900;
-    font-size: 40px;
-    font-weight: 800;
-}
-
-.section-title {
-    color: #333333;
-    font-size: 24px;
-    font-weight: 700;
-}
-
+[data-testid="stAppViewContainer"] { background: #F6F8FC; }
+[data-testid="stHeader"] { background: rgba(246,248,252,.88); }
+.block-container { padding-top: 1.5rem; padding-bottom: 2.2rem; max-width: 1500px; }
+h1, h2, h3 { letter-spacing: -0.02em; }
+[data-testid="stSidebar"] { background: #111827; border-right: 1px solid #1F2937; }
+[data-testid="stSidebar"] * { color: #E5E7EB; }
+[data-testid="stSidebar"] .stRadio label { font-size: 0.96rem; }
+[data-testid="stSidebar"] div[role="radiogroup"] label { padding: 0.58rem 0.65rem; border-radius: 10px; margin: 0.12rem 0; }
+[data-testid="stSidebar"] div[role="radiogroup"] label:hover { background: #1F2937; }
+[data-testid="stSidebar"] .stButton button { border-radius: 10px; }
+.sidebar-brand { padding: 0.45rem 0 1.15rem 0; border-bottom: 1px solid #273244; margin-bottom: 1rem; }
+.sidebar-brand .brand-name { font-size: 1.12rem; font-weight: 800; color: #FFFFFF; }
+.sidebar-brand .brand-sub { font-size: .78rem; color: #94A3B8; margin-top: .18rem; }
+.sidebar-section { color: #94A3B8; font-size: .72rem; font-weight: 800; letter-spacing: .08em; margin: 1rem 0 .35rem 0; }
+.page-kicker { color: #64748B; font-size: .82rem; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+.page-title { color: #0F172A; font-size: 2rem; line-height: 1.15; font-weight: 800; margin-top: .25rem; }
+.page-subtitle { color: #64748B; font-size: .95rem; margin-top: .35rem; margin-bottom: 1.25rem; }
+.kpi-card { background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 16px; padding: 1.15rem 1.25rem; box-shadow: 0 1px 2px rgba(15,23,42,.04); min-height: 120px; }
+.kpi-top { display:flex; justify-content:space-between; align-items:center; }
+.kpi-icon { font-size:1.25rem; background:#F1F5F9; width:38px; height:38px; border-radius:10px; display:flex; align-items:center; justify-content:center; }
+.kpi-label { color:#64748B; font-size:.78rem; font-weight:800; letter-spacing:.04em; text-transform:uppercase; }
+.kpi-value { color:#0F172A; font-size:1.85rem; font-weight:800; margin-top:.45rem; }
+.kpi-foot { color:#94A3B8; font-size:.78rem; margin-top:.25rem; }
+.panel-title { color:#0F172A; font-size:1rem; font-weight:800; margin-bottom:.2rem; }
+.panel-sub { color:#64748B; font-size:.82rem; margin-bottom:.8rem; }
+.stTextInput input, .stTextArea textarea, .stNumberInput input, div[data-baseweb="select"] > div { border-radius: 10px !important; }
+.stButton button { border-radius:10px; font-weight:700; }
+[data-testid="stDataFrame"] { background:#FFFFFF; border:1px solid #E5E7EB; border-radius:14px; overflow:hidden; }
+div[data-testid="stMetric"] { background:#FFFFFF; border:1px solid #E5E7EB; border-radius:14px; padding:1rem; }
+hr { border-color:#E5E7EB !important; }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown(
-    '<div class="main-title">💡 LightingSales CRM</div>',
-    unsafe_allow_html=True
-)
 
-st.markdown("---")
+def page_header(title, subtitle, kicker="LIGHTINGSALES CRM"):
+    st.markdown(
+        f'<div class="page-kicker">{kicker}</div><div class="page-title">{title}</div><div class="page-subtitle">{subtitle}</div>',
+        unsafe_allow_html=True
+    )
+
+
+def kpi_card(icon, label, value, foot=""):
+    st.markdown(
+        f'<div class="kpi-card"><div class="kpi-top"><div class="kpi-label">{label}</div><div class="kpi-icon">{icon}</div></div><div class="kpi-value">{value}</div><div class="kpi-foot">{foot}</div></div>',
+        unsafe_allow_html=True
+    )
+
 
 # ============================================================
-# 5A. CẬP NHẬT TỰ ĐỘNG
+# 5A. SIDEBAR / ĐIỀU HƯỚNG / CẬP NHẬT
 # ============================================================
 update_config = load_update_config()
 
 with st.sidebar:
-    st.markdown("### 🔄 Cập nhật CRM")
-    st.caption(f"Phiên bản hiện tại: v{APP_VERSION}")
-
-    with st.expander("⚙️ Cấu hình nguồn cập nhật", expanded=not bool(update_config.get("manifest_url"))):
+    st.markdown('<div class="sidebar-brand"><div class="brand-name">💡 LightingSales CRM</div><div class="brand-sub">Sales & Project Management</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section">MENU CHÍNH</div>', unsafe_allow_html=True)
+    page = st.radio(
+        "Điều hướng",
+        ["📊  Tổng quan", "👥  Khách hàng", "🏗️  Công trình", "🧾  Báo giá", "📦  Sản phẩm", "🏢  Thông tin công ty"],
+        label_visibility="collapsed",
+        key="main_navigation"
+    )
+    st.markdown('<div class="sidebar-section">HỆ THỐNG</div>', unsafe_allow_html=True)
+    with st.expander("🔄 Cập nhật CRM", expanded=False):
+        st.caption(f"Phiên bản hiện tại: v{APP_VERSION}")
         manifest_url_input = st.text_input(
             "URL version.json",
             value=update_config.get("manifest_url", ""),
             placeholder="https://raw.githubusercontent.com/.../version.json",
-            help="Chỉ cần cấu hình một lần. Những lần sau CRM sẽ nhớ địa chỉ này."
+            key="manifest_url_settings"
         )
-        if st.button("💾 Lưu nguồn cập nhật", use_container_width=True):
+        if st.button("💾 Lưu cấu hình", use_container_width=True, key="save_update_source"):
             save_update_config(manifest_url_input)
             st.success("Đã lưu nguồn cập nhật.")
             st.rerun()
-
-    if st.button("🔄 Kiểm tra & Cập nhật", type="primary", use_container_width=True):
-        with st.spinner("Đang kiểm tra phiên bản mới..."):
-            status, message = check_and_update(update_config.get("manifest_url", ""))
-
-        if status == "updated":
-            st.success(message)
-            time.sleep(1)
-            st.rerun()
-        elif status == "latest":
-            st.success(message)
-        else:
-            st.error(message)
-
-    st.caption("Database và ảnh sản phẩm không bị ghi đè khi cập nhật code.")
+        if st.button("🔄 Kiểm tra cập nhật", use_container_width=True, key="check_update"):
+            with st.spinner("Đang kiểm tra phiên bản mới..."):
+                status, message = check_and_update(update_config.get("manifest_url", ""))
+            if status == "updated":
+                st.success(message)
+                time.sleep(1)
+                st.rerun()
+            elif status == "latest":
+                st.success(message)
+            else:
+                st.error(message)
+    st.caption("SQLite local • Dữ liệu & ảnh không bị ghi đè")
 
 
 # ============================================================
 # 6. LOAD DATA
 # ============================================================
-
 df_kh, df_ct, df_sp, df_cty_saved = load_data()
-
-
-# ============================================================
-# 7. TABS
-# ============================================================
-
-(
-    t_dash,
-    t_kh,
-    t_ct,
-    t_quote,
-    t_kho,
-    t_info
-) = st.tabs([
-    "📊 Tổng quan",
-    "👥 Khách hàng",
-    "🏗️ Công trình",
-    "🧾 Báo giá",
-    "📦 Kho hàng",
-    "🏢 Thông tin cty"
-])
-
 
 # ============================================================
 # TAB 1 - DASHBOARD
 # ============================================================
 
-with t_dash:
+if page == "📊  Tổng quan":
+    page_header("Tổng quan kinh doanh", "Theo dõi nhanh khách hàng, công trình và danh mục sản phẩm của LightingSales.")
 
-    st.markdown(
-        '<div class="section-title">Dashboard tổng quan hệ thống</div>',
-        unsafe_allow_html=True
-    )
+    high_priority = 0
+    active_projects = 0
+    if not df_ct.empty:
+        if "uu_tien" in df_ct.columns:
+            high_priority = int(df_ct["uu_tien"].fillna("").astype(str).str.lower().eq("high").sum())
+        if "giai_doan" in df_ct.columns:
+            active_projects = int((~df_ct["giai_doan"].fillna("").isin(["Hoàn thành", ""])).sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        kpi_card("👥", "Khách hàng", f"{len(df_kh)}", "Tổng hồ sơ khách hàng")
+    with c2:
+        kpi_card("🏗️", "Công trình", f"{len(df_ct)}", f"{active_projects} dự án đang theo dõi")
+    with c3:
+        kpi_card("📦", "Sản phẩm", f"{len(df_sp)}", "Mặt hàng trong danh mục")
+    with c4:
+        kpi_card("⚡", "Ưu tiên cao", f"{high_priority}", "Công trình cần chú ý")
 
     st.markdown("")
+    left, right = st.columns([1.55, 1], gap="large")
+    with left:
+        st.markdown('<div class="panel-title">🏗️ Công trình gần đây</div>', unsafe_allow_html=True)
+        st.markdown('<div class="panel-sub">Các công trình mới nhất đang có trong hệ thống.</div>', unsafe_allow_html=True)
+        if df_ct.empty:
+            st.info("Chưa có công trình. Vào menu Công trình để thêm dự án đầu tiên.")
+        else:
+            recent_ct = df_ct[["ten_du_an", "dia_chi_cong_trinh", "uu_tien", "giai_doan", "ngay_khoi_tao"]].head(7).copy()
+            recent_ct.columns = ["Công trình", "Địa chỉ", "Ưu tiên", "Giai đoạn", "Ngày khởi tạo"]
+            st.dataframe(recent_ct, use_container_width=True, hide_index=True)
+    with right:
+        st.markdown('<div class="panel-title">👥 Khách hàng mới</div>', unsafe_allow_html=True)
+        st.markdown('<div class="panel-sub">Danh sách khách hàng được thêm gần đây.</div>', unsafe_allow_html=True)
+        if df_kh.empty:
+            st.info("Chưa có khách hàng. Vào menu Khách hàng để tạo hồ sơ đầu tiên.")
+        else:
+            recent_kh = df_kh[["ten", "ten_cong_ty", "phan_loai_kh", "ngay_tao"]].head(7).copy()
+            recent_kh.columns = ["Khách hàng", "Công ty", "Phân loại", "Ngày tạo"]
+            st.dataframe(recent_kh, use_container_width=True, hide_index=True)
 
-    m1, m2, m3 = st.columns(3)
-
-    with m1:
-        st.metric(
-            "👥 TỔNG KHÁCH HÀNG",
-            f"{len(df_kh)} người"
-        )
-
-    with m2:
-        st.metric(
-            "🏗️ TỔNG CÔNG TRÌNH",
-            f"{len(df_ct)} dự án"
-        )
-
-    with m3:
-        st.metric(
-            "📦 SẢN PHẨM TRONG KHO",
-            f"{len(df_sp)} mặt hàng"
-        )
-
-    st.markdown("---")
-
-    st.info(
-        "💡 LightingSales CRM đang chạy bằng SQLite. "
-        "Dữ liệu được lưu trong file lightingsales.db "
-        "ngay bên cạnh file app.py."
-    )
+    st.markdown("")
+    st.info("💡 Dữ liệu được lưu cục bộ trong lightingsales.db. Cập nhật code không ghi đè database hoặc ảnh sản phẩm.")
 
 
 # ============================================================
 # TAB 2 - KHÁCH HÀNG
 # ============================================================
 
-with t_kh:
+if page == "👥  Khách hàng":
+    page_header("Khách hàng", "Quản lý khách hàng, công ty, địa chỉ và phân loại đối tác.")
 
     st.markdown("## 👥 Quản lý khách hàng")
 
@@ -592,7 +608,8 @@ with t_kh:
 # TAB 3 - CÔNG TRÌNH
 # ============================================================
 
-with t_ct:
+if page == "🏗️  Công trình":
+    page_header("Công trình", "Theo dõi công trình, địa chỉ, mức ưu tiên và giai đoạn bán hàng.")
 
     st.markdown("## 🏗️ Quản lý công trình / dự án")
 
@@ -768,7 +785,8 @@ with t_ct:
 # TAB 4 - BÁO GIÁ
 # ============================================================
 
-with t_quote:
+if page == "🧾  Báo giá":
+    page_header("Báo giá", "Tạo và quản lý báo giá theo khách hàng, công trình và sản phẩm.")
 
     st.markdown("## 🧾 Báo giá")
 
@@ -816,7 +834,8 @@ with t_quote:
 # TAB 5 - KHO
 # ============================================================
 
-with t_kho:
+if page == "📦  Sản phẩm":
+    page_header("Sản phẩm", "Quản lý danh mục sản phẩm, giá bán, mô tả và hình ảnh.")
 
     st.markdown("## 📦 Kho sản phẩm chiếu sáng")
 
@@ -1115,7 +1134,8 @@ with t_kho:
 # TAB 6 - THÔNG TIN CÔNG TY
 # ============================================================
 
-with t_info:
+if page == "🏢  Thông tin công ty":
+    page_header("Thông tin công ty", "Thông tin doanh nghiệp sử dụng trên báo giá và hồ sơ CRM.")
 
     st.markdown("## 🏢 Thông tin doanh nghiệp")
 
