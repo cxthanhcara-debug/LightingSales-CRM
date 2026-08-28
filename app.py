@@ -13,7 +13,7 @@ import re
 import html
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ============================================================
 # 1. TỰ KIỂM TRA / CÀI STREAMLIT + PANDAS
@@ -51,7 +51,7 @@ PRODUCT_IMAGE_DIR = os.path.join(BASE_DIR, "product_images")
 os.makedirs(PRODUCT_IMAGE_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -540,49 +540,206 @@ df_kh, df_ct, df_sp, df_cty_saved = load_data()
 # ============================================================
 
 if page == "📊  Tổng quan":
-    page_header("Tổng quan kinh doanh", "Theo dõi nhanh khách hàng, công trình và danh mục sản phẩm của LightingSales.")
+    page_header(
+        "Tổng quan kinh doanh",
+        "Mở CRM là biết ngay dự án nào cần xử lý hôm nay, dự án nào quá hạn và việc gì sắp tới."
+    )
 
     high_priority = 0
     active_projects = 0
     if not df_ct.empty:
         if "uu_tien" in df_ct.columns:
-            high_priority = int(df_ct["uu_tien"].fillna("").astype(str).str.lower().eq("high").sum())
+            high_priority = int(
+                df_ct["uu_tien"].fillna("").astype(str).str.lower().eq("high").sum()
+            )
         if "giai_doan" in df_ct.columns:
-            active_projects = int((~df_ct["giai_doan"].fillna("").isin(["Hoàn thành", ""])).sum())
+            active_projects = int(
+                (~df_ct["giai_doan"].fillna("").isin(["Hoàn thành", ""])).sum()
+            )
 
+    # --------------------------------------------------------
+    # Phân loại follow-up theo ngày
+    # --------------------------------------------------------
+    today = datetime.now().date()
+
+    def parse_follow_date(value):
+        """Đọc ngày follow-up an toàn. Hỗ trợ dd/mm/yyyy và yyyy-mm-dd."""
+        if value is None or pd.isna(value):
+            return None
+        raw = str(value).strip()
+        if not raw:
+            return None
+        for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(raw, fmt).date()
+            except ValueError:
+                pass
+        return None
+
+    follow_rows = []
+    if not df_ct.empty:
+        for _, r in df_ct.iterrows():
+            stage = str(r.get("giai_doan", "") or "").strip()
+            action = str(r.get("viec_tiep_theo", "") or "").strip()
+            follow_raw = r.get("ngay_theo_doi", "")
+            follow_date = parse_follow_date(follow_raw)
+
+            # Chỉ đưa vào trung tâm công việc nếu còn dự án và có việc tiếp theo.
+            if stage == "Hoàn thành" or not action or follow_date is None:
+                continue
+
+            follow_rows.append({
+                "id": r.get("id"),
+                "ten_du_an": str(r.get("ten_du_an", "") or ""),
+                "giai_doan": stage,
+                "uu_tien": str(r.get("uu_tien", "") or ""),
+                "viec_tiep_theo": action,
+                "ngay_theo_doi": follow_date,
+            })
+
+    overdue_items = sorted(
+        [x for x in follow_rows if x["ngay_theo_doi"] < today],
+        key=lambda x: x["ngay_theo_doi"]
+    )
+    today_items = [
+        x for x in follow_rows if x["ngay_theo_doi"] == today
+    ]
+    upcoming_items = sorted(
+        [
+            x for x in follow_rows
+            if today < x["ngay_theo_doi"] <= today + timedelta(days=7)
+        ],
+        key=lambda x: x["ngay_theo_doi"]
+    )
+
+    # --------------------------------------------------------
+    # KPI tổng quan
+    # --------------------------------------------------------
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        kpi_card("👥", "Khách hàng", f"{len(df_kh)}", "Tổng hồ sơ khách hàng")
-    with c2:
         kpi_card("🏗️", "Công trình", f"{len(df_ct)}", f"{active_projects} dự án đang theo dõi")
+    with c2:
+        kpi_card("🔴", "Quá hạn", f"{len(overdue_items)}", "Việc follow-up đã trễ")
     with c3:
-        kpi_card("📦", "Sản phẩm", f"{len(df_sp)}", "Mặt hàng trong danh mục")
+        kpi_card("📅", "Hôm nay", f"{len(today_items)}", "Việc cần xử lý hôm nay")
     with c4:
-        kpi_card("⚡", "Ưu tiên cao", f"{high_priority}", "Công trình cần chú ý")
+        kpi_card("⏳", "7 ngày tới", f"{len(upcoming_items)}", "Việc sắp phải theo dõi")
 
     st.markdown("")
-    left, right = st.columns([1.55, 1], gap="large")
+    st.markdown('<div class="panel-title">✅ Trung tâm công việc</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="panel-sub">Ưu tiên xử lý theo ngày follow-up đã đặt trong từng công trình.</div>',
+        unsafe_allow_html=True
+    )
+
+    def render_task_group(title, icon, items, empty_text):
+        st.markdown(f"#### {icon} {title}")
+        if not items:
+            st.caption(empty_text)
+            return
+        task_df = pd.DataFrame([
+            {
+                "Công trình": x["ten_du_an"],
+                "Giai đoạn": x["giai_doan"],
+                "Ưu tiên": x["uu_tien"],
+                "Việc tiếp theo": x["viec_tiep_theo"],
+                "Ngày": x["ngay_theo_doi"].strftime("%d/%m/%Y"),
+            }
+            for x in items[:8]
+        ])
+        st.dataframe(task_df, use_container_width=True, hide_index=True)
+
+    task1, task2, task3 = st.columns(3, gap="large")
+    with task1:
+        render_task_group(
+            "Quá hạn",
+            "🔴",
+            overdue_items,
+            "Không có việc quá hạn."
+        )
+    with task2:
+        render_task_group(
+            "Hôm nay",
+            "📅",
+            today_items,
+            "Không có việc cần xử lý hôm nay."
+        )
+    with task3:
+        render_task_group(
+            "Sắp tới",
+            "⏳",
+            upcoming_items,
+            "Không có follow-up trong 7 ngày tới."
+        )
+
+    st.markdown("---")
+
+    left, right = st.columns([1.6, 1], gap="large")
     with left:
-        st.markdown('<div class="panel-title">🏗️ Công trình gần đây</div>', unsafe_allow_html=True)
-        st.markdown('<div class="panel-sub">Các công trình mới nhất đang có trong hệ thống.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="panel-title">🏗️ Công trình đang theo dõi</div>',
+            unsafe_allow_html=True
+        )
+        st.markdown(
+            '<div class="panel-sub">Giai đoạn, việc tiếp theo và ngày follow-up gần nhất.</div>',
+            unsafe_allow_html=True
+        )
+
         if df_ct.empty:
             st.info("Chưa có công trình. Vào menu Công trình để thêm dự án đầu tiên.")
         else:
-            recent_ct = df_ct[["ten_du_an", "uu_tien", "giai_doan", "viec_tiep_theo", "ngay_theo_doi"]].head(7).copy()
-            recent_ct.columns = ["Công trình", "Ưu tiên", "Giai đoạn", "Việc tiếp theo", "Theo dõi"]
-            st.dataframe(recent_ct, use_container_width=True, hide_index=True)
+            active_df = df_ct[
+                ~df_ct["giai_doan"].fillna("").eq("Hoàn thành")
+            ].copy()
+
+            if active_df.empty:
+                st.success("Tất cả công trình hiện tại đã hoàn thành.")
+            else:
+                # Sắp xếp: High trước, sau đó theo ngày follow-up hợp lệ.
+                active_df["_priority_order"] = (
+                    active_df["uu_tien"]
+                    .map({"High": 1, "Medium": 2, "Low": 3})
+                    .fillna(4)
+                )
+                active_df["_follow_sort"] = active_df["ngay_theo_doi"].apply(
+                    lambda x: parse_follow_date(x) or datetime.max.date()
+                )
+                active_df = active_df.sort_values(
+                    ["_priority_order", "_follow_sort", "id"],
+                    ascending=[True, True, False]
+                )
+
+                project_view = active_df[
+                    ["ten_du_an", "uu_tien", "giai_doan", "viec_tiep_theo", "ngay_theo_doi"]
+                ].head(10).copy()
+                project_view.columns = [
+                    "Công trình", "Ưu tiên", "Giai đoạn", "Việc tiếp theo", "Theo dõi"
+                ]
+                st.dataframe(project_view, use_container_width=True, hide_index=True)
+
     with right:
-        st.markdown('<div class="panel-title">👥 Khách hàng mới</div>', unsafe_allow_html=True)
-        st.markdown('<div class="panel-sub">Danh sách khách hàng được thêm gần đây.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="panel-title">👥 Khách hàng mới</div>',
+            unsafe_allow_html=True
+        )
+        st.markdown(
+            '<div class="panel-sub">Danh sách khách hàng được thêm gần đây.</div>',
+            unsafe_allow_html=True
+        )
         if df_kh.empty:
             st.info("Chưa có khách hàng. Vào menu Khách hàng để tạo hồ sơ đầu tiên.")
         else:
-            recent_kh = df_kh[["ten", "ten_cong_ty", "phan_loai_kh", "ngay_tao"]].head(7).copy()
+            recent_kh = df_kh[
+                ["ten", "ten_cong_ty", "phan_loai_kh", "ngay_tao"]
+            ].head(7).copy()
             recent_kh.columns = ["Khách hàng", "Công ty", "Phân loại", "Ngày tạo"]
             st.dataframe(recent_kh, use_container_width=True, hide_index=True)
 
     st.markdown("")
-    st.info("💡 Dữ liệu được lưu cục bộ trong lightingsales.db. Cập nhật code không ghi đè database hoặc ảnh sản phẩm.")
+    st.info(
+        "💡 Mẹo: ở menu Công trình, hãy luôn điền 'Việc cần làm tiếp theo' "
+        "và 'Ngày cần theo dõi'. Dashboard sẽ tự đưa công việc vào Quá hạn / Hôm nay / 7 ngày tới."
+    )
 
 
 # ============================================================

@@ -1,6 +1,6 @@
 {
-  "version": "2.5.0",
+  "version": "2.6.0",
   "app_url": "https://raw.githubusercontent.com/cxthanhcara-debug/LightingSales-CRM/main/app.py",
-  "sha256": "43e59901341b89b359d4b757007730329172338be354c93da5c8aa6b65995e59",
-  "notes": "v2.5.0 - Project Pipeline/Kanban: xem dự án theo 8 giai đoạn, việc tiếp theo, ngày follow-up; giữ chế độ danh sách."
+  "sha256": "61d2143989b2c2365bf72db491c8ea4574fa3b79d0171263bb3e3224b3b68999",
+  "notes": "v2.6.0 - Action Dashboard: Quá hạn, Hôm nay, 7 ngày tới; ưu tiên công việc dự án theo ngày follow-up."
 }
