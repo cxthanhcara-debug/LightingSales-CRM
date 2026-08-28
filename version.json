@@ -1,6 +1,6 @@
 {
-  "version": "2.4.0",
+  "version": "2.4.1",
   "app_url": "https://raw.githubusercontent.com/cxthanhcara-debug/LightingSales-CRM/main/app.py",
-  "sha256": "9cf419db632ae6893edd9edc66ccaf46ea671a12ff14b6155f8c7a199ad88d20",
-  "notes": "v2.4.0 - Project Control Center: theo dõi giai đoạn, ưu tiên, việc tiếp theo và ngày cần follow-up."
+  "sha256": "59efaa09e7aa517fca214caffdd9a59b9938fc1144d974c00bb9ab4531a1d2de",
+  "notes": "v2.4.1 - Light Sidebar UI: sidebar sáng, gọn hơn, giảm tương phản và tăng không gian làm việc."
 }

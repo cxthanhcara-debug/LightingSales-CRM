@@ -50,7 +50,7 @@ PRODUCT_IMAGE_DIR = os.path.join(BASE_DIR, "product_images")
 os.makedirs(PRODUCT_IMAGE_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.4.1"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -328,16 +328,73 @@ st.markdown("""
 [data-testid="stHeader"] { background: rgba(246,248,252,.88); }
 .block-container { padding-top: 1.5rem; padding-bottom: 2.2rem; max-width: 1500px; }
 h1, h2, h3 { letter-spacing: -0.02em; }
-[data-testid="stSidebar"] { background: #111827; border-right: 1px solid #1F2937; }
-[data-testid="stSidebar"] * { color: #E5E7EB; }
-[data-testid="stSidebar"] .stRadio label { font-size: 0.96rem; }
-[data-testid="stSidebar"] div[role="radiogroup"] label { padding: 0.58rem 0.65rem; border-radius: 10px; margin: 0.12rem 0; }
-[data-testid="stSidebar"] div[role="radiogroup"] label:hover { background: #1F2937; }
-[data-testid="stSidebar"] .stButton button { border-radius: 10px; }
-.sidebar-brand { padding: 0.45rem 0 1.15rem 0; border-bottom: 1px solid #273244; margin-bottom: 1rem; }
-.sidebar-brand .brand-name { font-size: 1.12rem; font-weight: 800; color: #FFFFFF; }
-.sidebar-brand .brand-sub { font-size: .78rem; color: #94A3B8; margin-top: .18rem; }
-.sidebar-section { color: #94A3B8; font-size: .72rem; font-weight: 800; letter-spacing: .08em; margin: 1rem 0 .35rem 0; }
+[data-testid="stSidebar"] {
+    background: #F5F7FA;
+    border-right: 1px solid #E2E8F0;
+    min-width: 278px !important;
+    max-width: 278px !important;
+}
+[data-testid="stSidebar"] > div:first-child { width: 278px !important; }
+[data-testid="stSidebar"] * { color: #1F2937; }
+[data-testid="stSidebar"] .stRadio label { font-size: 0.94rem; font-weight: 600; }
+[data-testid="stSidebar"] div[role="radiogroup"] label {
+    padding: 0.60rem 0.72rem;
+    border-radius: 10px;
+    margin: 0.10rem 0;
+    transition: background .15s ease, box-shadow .15s ease;
+}
+[data-testid="stSidebar"] div[role="radiogroup"] label:hover {
+    background: #EAF0F8;
+}
+[data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) {
+    background: #FFFFFF;
+    box-shadow: 0 1px 3px rgba(15,23,42,.08);
+    border-left: 3px solid #2563EB;
+}
+[data-testid="stSidebar"] div[role="radiogroup"] label > div:first-child {
+    display: none;
+}
+[data-testid="stSidebar"] .stButton button {
+    border-radius: 10px;
+    border: 1px solid #DCE3EC;
+    background: #FFFFFF;
+    color: #1F2937;
+}
+[data-testid="stSidebar"] .stButton button:hover {
+    border-color: #B8C5D6;
+    background: #F8FAFC;
+}
+[data-testid="stSidebar"] .stExpander {
+    border: 1px solid #E2E8F0;
+    background: #FFFFFF;
+    border-radius: 12px;
+}
+[data-testid="stSidebar"] input {
+    background: #FFFFFF !important;
+    color: #1F2937 !important;
+}
+.sidebar-brand {
+    padding: 0.35rem 0 1.05rem 0;
+    border-bottom: 1px solid #E2E8F0;
+    margin-bottom: .85rem;
+}
+.sidebar-brand .brand-name {
+    font-size: 1.08rem;
+    font-weight: 800;
+    color: #0F172A;
+}
+.sidebar-brand .brand-sub {
+    font-size: .76rem;
+    color: #64748B;
+    margin-top: .18rem;
+}
+.sidebar-section {
+    color: #64748B;
+    font-size: .70rem;
+    font-weight: 800;
+    letter-spacing: .08em;
+    margin: .9rem 0 .32rem 0;
+}
 .page-kicker { color: #64748B; font-size: .82rem; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
 .page-title { color: #0F172A; font-size: 2rem; line-height: 1.15; font-weight: 800; margin-top: .25rem; }
 .page-subtitle { color: #64748B; font-size: .95rem; margin-top: .35rem; margin-bottom: 1.25rem; }
