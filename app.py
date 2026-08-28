@@ -50,7 +50,7 @@ PRODUCT_IMAGE_DIR = os.path.join(BASE_DIR, "product_images")
 os.makedirs(PRODUCT_IMAGE_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -238,6 +238,8 @@ conn.commit()
 ensure_column("khach_hang_goc", "ten_cong_ty", "TEXT DEFAULT ''")
 ensure_column("khach_hang_goc", "dia_chi_cong_ty", "TEXT DEFAULT ''")
 ensure_column("cong_trinh_new", "dia_chi_cong_trinh", "TEXT DEFAULT ''")
+ensure_column("cong_trinh_new", "viec_tiep_theo", "TEXT DEFAULT ''")
+ensure_column("cong_trinh_new", "ngay_theo_doi", "TEXT DEFAULT ''")
 ensure_column("san_pham", "mo_ta", "TEXT DEFAULT ''")
 ensure_column("san_pham", "hinh_anh", "TEXT DEFAULT ''")
 
@@ -270,6 +272,8 @@ def load_data():
             uu_tien,
             giai_doan,
             ngay_khoi_tao,
+            viec_tiep_theo,
+            ngay_theo_doi,
             note
         FROM cong_trinh_new
         ORDER BY id DESC
@@ -447,8 +451,8 @@ if page == "📊  Tổng quan":
         if df_ct.empty:
             st.info("Chưa có công trình. Vào menu Công trình để thêm dự án đầu tiên.")
         else:
-            recent_ct = df_ct[["ten_du_an", "dia_chi_cong_trinh", "uu_tien", "giai_doan", "ngay_khoi_tao"]].head(7).copy()
-            recent_ct.columns = ["Công trình", "Địa chỉ", "Ưu tiên", "Giai đoạn", "Ngày khởi tạo"]
+            recent_ct = df_ct[["ten_du_an", "uu_tien", "giai_doan", "viec_tiep_theo", "ngay_theo_doi"]].head(7).copy()
+            recent_ct.columns = ["Công trình", "Ưu tiên", "Giai đoạn", "Việc tiếp theo", "Theo dõi"]
             st.dataframe(recent_ct, use_container_width=True, hide_index=True)
     with right:
         st.markdown('<div class="panel-title">👥 Khách hàng mới</div>', unsafe_allow_html=True)
@@ -609,179 +613,162 @@ if page == "👥  Khách hàng":
 # ============================================================
 
 if page == "🏗️  Công trình":
-    page_header("Công trình", "Theo dõi công trình, địa chỉ, mức ưu tiên và giai đoạn bán hàng.")
+    page_header("Công trình", "Trung tâm theo dõi dự án: đang ở giai đoạn nào và việc cần làm tiếp theo.")
 
-    st.markdown("## 🏗️ Quản lý công trình / dự án")
+    # --- Project control KPIs ---
+    total_ct = len(df_ct)
+    active_ct = int((~df_ct["giai_doan"].fillna("").eq("Hoàn thành")).sum()) if total_ct else 0
+    high_ct = int(df_ct["uu_tien"].fillna("").str.lower().eq("high").sum()) if total_ct else 0
+    follow_ct = int(df_ct["viec_tiep_theo"].fillna("").str.strip().ne("").sum()) if total_ct else 0
 
-    st.markdown("### ➕ Tạo công trình mới")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: kpi_card("🏗️", "TỔNG DỰ ÁN", total_ct, "Toàn bộ công trình")
+    with c2: kpi_card("▶️", "ĐANG THEO DÕI", active_ct, "Chưa hoàn thành")
+    with c3: kpi_card("⚡", "ƯU TIÊN CAO", high_ct, "Cần chú ý")
+    with c4: kpi_card("📌", "CÓ VIỆC TIẾP THEO", follow_ct, "Đã có action")
 
-    ten_du_an = st.text_input(
-        "Tên dự án / công trình *",
-        placeholder="Ví dụ: Penthouse Landmark 81"
-    )
-
-    dia_chi_cong_trinh = st.text_input(
-        "Địa chỉ công trình",
-        placeholder="Nhập địa chỉ thi công / địa điểm dự án"
-    )
-
-    if not df_kh.empty:
-
-        options_kh = {
-            f"{r['ten']} - {r['thoai']}": r["thoai"]
-            for _, r in df_kh.iterrows()
-        }
-
-        kh_label = st.selectbox(
-            "Khách hàng / chủ đầu tư *",
-            list(options_kh.keys())
-        )
-
-        thoai_khach_save = options_kh[kh_label]
-
-    else:
-
-        st.warning(
-            "⚠️ Chưa có khách hàng. "
-            "Hãy tạo khách hàng trước."
-        )
-
-        thoai_khach_save = ""
-
-    uu_tien = st.selectbox(
-        "Mức ưu tiên",
-        ["High", "Medium", "Low"]
-    )
-
-    giai_doan = st.selectbox(
-        "Giai đoạn dự án",
-        [
-            "Báo giá",
-            "Thương lượng",
-            "Triển khai",
-            "Hoàn thành"
-        ]
-    )
-
-    ngay_khoi_tao = st.date_input(
-        "Ngày khởi tạo",
-        value=datetime.now().date()
-    )
-
-    note = st.text_area(
-        "Ghi chú",
-        key="project_note"
-    )
-
-    if st.button(
-        "💾 Lưu công trình",
-        type="primary"
-    ):
-
-        if not ten_du_an.strip():
-
-            st.warning(
-                "⚠️ Vui lòng nhập tên dự án."
-            )
-
-        elif not thoai_khach_save:
-
-            st.warning(
-                "⚠️ Vui lòng chọn khách hàng."
-            )
-
-        else:
-
-            cursor.execute("""
-                INSERT INTO cong_trinh_new
-                (
-                    ten_du_an,
-                    thoai_khach,
-                    dia_chi_cong_trinh,
-                    uu_tien,
-                    giai_doan,
-                    ngay_khoi_tao,
-                    note
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                ten_du_an.strip(),
-                thoai_khach_save,
-                dia_chi_cong_trinh.strip(),
-                uu_tien,
-                giai_doan,
-                ngay_khoi_tao.strftime("%d/%m/%Y"),
-                note.strip()
-            ))
-
-            conn.commit()
-
-            st.success(
-                "🎉 Đã tạo công trình!"
-            )
-
-            st.rerun()
-
-    st.markdown("---")
-
-    st.markdown("### 📋 Danh sách công trình")
+    st.markdown("### 🎯 Bảng điều hành dự án")
+    st.caption("Tập trung vào Giai đoạn → Việc tiếp theo → Ngày theo dõi. Đây là màn hình làm việc chính cho các dự án.")
 
     df_ct_joined = pd.read_sql_query("""
         SELECT
             c.id,
             c.ten_du_an,
-            c.dia_chi_cong_trinh AS Dia_Chi_Cong_Trinh,
             k.ten AS Chu_Dau_Tu,
+            c.dia_chi_cong_trinh AS Dia_Chi,
             c.uu_tien,
             c.giai_doan,
+            c.viec_tiep_theo,
+            c.ngay_theo_doi,
             c.ngay_khoi_tao,
             c.note
         FROM cong_trinh_new c
-        LEFT JOIN khach_hang_goc k
-            ON c.thoai_khach = k.thoai
-        ORDER BY c.id DESC
+        LEFT JOIN khach_hang_goc k ON c.thoai_khach = k.thoai
+        ORDER BY
+            CASE c.uu_tien WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END,
+            c.id DESC
     """, conn)
 
-    st.dataframe(
-        df_ct_joined,
-        width="stretch",
-        hide_index=True
-    )
+    f1, f2, f3 = st.columns([1.5, 1, 1])
+    with f1:
+        search_ct = st.text_input("🔎 Tìm công trình", placeholder="Tên dự án, chủ đầu tư, địa chỉ...", key="project_search")
+    with f2:
+        stage_options = ["Tất cả"] + sorted([x for x in df_ct_joined["giai_doan"].dropna().unique().tolist() if x])
+        stage_filter = st.selectbox("Giai đoạn", stage_options, key="project_stage_filter")
+    with f3:
+        priority_filter = st.selectbox("Ưu tiên", ["Tất cả", "High", "Medium", "Low"], key="project_priority_filter")
+
+    view = df_ct_joined.copy()
+    if search_ct.strip():
+        q = search_ct.strip().lower()
+        mask = view.astype(str).apply(lambda col: col.str.lower().str.contains(q, na=False)).any(axis=1)
+        view = view[mask]
+    if stage_filter != "Tất cả":
+        view = view[view["giai_doan"] == stage_filter]
+    if priority_filter != "Tất cả":
+        view = view[view["uu_tien"] == priority_filter]
+
+    display_cols = ["id","ten_du_an","Chu_Dau_Tu","uu_tien","giai_doan","viec_tiep_theo","ngay_theo_doi"]
+    display = view[display_cols].copy()
+    display.columns = ["ID","Công trình","Khách hàng / CĐT","Ưu tiên","Giai đoạn","Việc tiếp theo","Ngày theo dõi"]
+    st.dataframe(display, width="stretch", hide_index=True)
+
+    st.markdown("---")
+    action_col, create_col = st.columns(2)
+
+    with action_col:
+        with st.expander("✏️ Cập nhật tiến độ / việc tiếp theo", expanded=not df_ct.empty):
+            if df_ct_joined.empty:
+                st.info("Chưa có công trình để cập nhật.")
+            else:
+                project_ids = df_ct_joined["id"].tolist()
+                edit_id = st.selectbox(
+                    "Chọn công trình",
+                    project_ids,
+                    format_func=lambda x: f"#{x} - {df_ct_joined.loc[df_ct_joined['id']==x, 'ten_du_an'].iloc[0]}",
+                    key="edit_project_id"
+                )
+                row = df_ct_joined[df_ct_joined["id"] == edit_id].iloc[0]
+                stages = ["Tiếp cận", "Khảo sát", "Báo giá", "Thương lượng", "Chốt đơn", "Triển khai", "Hoàn thành", "Tạm dừng"]
+                current_stage = row["giai_doan"] if row["giai_doan"] in stages else "Báo giá"
+                new_stage = st.selectbox("Giai đoạn hiện tại", stages, index=stages.index(current_stage), key="edit_project_stage")
+                priorities = ["High", "Medium", "Low"]
+                current_pr = row["uu_tien"] if row["uu_tien"] in priorities else "Medium"
+                new_priority = st.selectbox("Mức ưu tiên", priorities, index=priorities.index(current_pr), key="edit_project_priority")
+                next_action = st.text_area(
+                    "Việc cần làm tiếp theo",
+                    value="" if pd.isna(row["viec_tiep_theo"]) else str(row["viec_tiep_theo"]),
+                    placeholder="Ví dụ: Gửi lại báo giá revision 02; gọi khách xác nhận mẫu đèn...",
+                    key=f"next_action_{edit_id}"
+                )
+                follow_date_text = st.text_input(
+                    "Ngày cần theo dõi",
+                    value="" if pd.isna(row["ngay_theo_doi"]) else str(row["ngay_theo_doi"]),
+                    placeholder="dd/mm/yyyy",
+                    key=f"follow_date_{edit_id}"
+                )
+                if st.button("💾 Lưu cập nhật dự án", type="primary", key="save_project_progress"):
+                    cursor.execute("""
+                        UPDATE cong_trinh_new
+                        SET giai_doan=?, uu_tien=?, viec_tiep_theo=?, ngay_theo_doi=?
+                        WHERE id=?
+                    """, (new_stage, new_priority, next_action.strip(), follow_date_text.strip(), int(edit_id)))
+                    conn.commit()
+                    st.success("Đã cập nhật tiến độ dự án.")
+                    st.rerun()
+
+    with create_col:
+        with st.expander("➕ Tạo công trình mới"):
+            ten_du_an = st.text_input("Tên dự án / công trình *", placeholder="Ví dụ: Penthouse Landmark 81", key="new_project_name")
+            dia_chi_cong_trinh = st.text_input("Địa chỉ công trình", key="new_project_address")
+            if not df_kh.empty:
+                options_kh = {f"{r['ten']} - {r['thoai']}": r["thoai"] for _, r in df_kh.iterrows()}
+                kh_label = st.selectbox("Khách hàng / chủ đầu tư *", list(options_kh.keys()), key="new_project_customer")
+                thoai_khach_save = options_kh[kh_label]
+            else:
+                st.warning("Chưa có khách hàng. Hãy tạo khách hàng trước.")
+                thoai_khach_save = ""
+            uu_tien = st.selectbox("Mức ưu tiên", ["High", "Medium", "Low"], index=1, key="new_project_priority")
+            giai_doan = st.selectbox("Giai đoạn dự án", ["Tiếp cận","Khảo sát","Báo giá","Thương lượng","Chốt đơn","Triển khai","Hoàn thành","Tạm dừng"], key="new_project_stage")
+            ngay_khoi_tao = st.date_input("Ngày khởi tạo", value=datetime.now().date(), key="new_project_date")
+            next_action_new = st.text_area("Việc cần làm tiếp theo", key="new_project_next_action")
+            follow_new = st.text_input("Ngày cần theo dõi", placeholder="dd/mm/yyyy", key="new_project_follow_date")
+            note = st.text_area("Ghi chú", key="new_project_note")
+            if st.button("💾 Lưu công trình", type="primary", key="save_new_project"):
+                if not ten_du_an.strip():
+                    st.warning("Vui lòng nhập tên dự án.")
+                elif not thoai_khach_save:
+                    st.warning("Vui lòng chọn khách hàng.")
+                else:
+                    cursor.execute("""
+                        INSERT INTO cong_trinh_new
+                        (ten_du_an, thoai_khach, dia_chi_cong_trinh, uu_tien, giai_doan,
+                         ngay_khoi_tao, viec_tiep_theo, ngay_theo_doi, note)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        ten_du_an.strip(), thoai_khach_save, dia_chi_cong_trinh.strip(),
+                        uu_tien, giai_doan, ngay_khoi_tao.strftime("%d/%m/%Y"),
+                        next_action_new.strip(), follow_new.strip(), note.strip()
+                    ))
+                    conn.commit()
+                    st.success("Đã tạo công trình!")
+                    st.rerun()
 
     if not df_ct.empty:
-
-        with st.expander(
-            "🗑️ Xóa công trình"
-        ):
-
+        with st.expander("🗑️ Xóa công trình"):
             ct_del_id = st.selectbox(
-                "Chọn công trình",
+                "Chọn công trình cần xóa",
                 df_ct["id"].tolist(),
-                format_func=lambda x:
-                    f"ID {x} - "
-                    f"{df_ct.loc[df_ct['id'] == x, 'ten_du_an'].values[0]}"
+                format_func=lambda x: f"ID {x} - {df_ct.loc[df_ct['id']==x, 'ten_du_an'].iloc[0]}",
+                key="delete_project_id"
             )
-
-            if st.button(
-                "❌ Xác nhận xóa công trình",
-                type="primary"
-            ):
-
-                cursor.execute(
-                    "DELETE FROM cong_trinh_new WHERE id = ?",
-                    (ct_del_id,)
-                )
-
+            if st.button("🗑️ Xóa công trình", key="delete_project_btn"):
+                cursor.execute("DELETE FROM cong_trinh_new WHERE id = ?", (int(ct_del_id),))
                 conn.commit()
-
-                st.success(
-                    "🎉 Đã xóa công trình!"
-                )
-
+                st.success("Đã xóa công trình!")
                 st.rerun()
 
 
-# ============================================================
 # TAB 4 - BÁO GIÁ
 # ============================================================
 
