@@ -1,6 +1,6 @@
 {
-  "version": "2.6.0",
+  "version": "3.0.0",
   "app_url": "https://raw.githubusercontent.com/cxthanhcara-debug/LightingSales-CRM/main/app.py",
-  "sha256": "61d2143989b2c2365bf72db491c8ea4574fa3b79d0171263bb3e3224b3b68999",
-  "notes": "v2.6.0 - Action Dashboard: Quá hạn, Hôm nay, 7 ngày tới; ưu tiên công việc dự án theo ngày follow-up."
+  "sha256": "15888e48935f94f4b1f3e91bdb2a0605119349edb1fec61f474a97b8892801f9",
+  "notes": "v3.0.0 - Data Management & Company Branding: chỉnh sửa/cập nhật khách hàng, sản phẩm; giữ liên kết công trình khi đổi SĐT; upload/thay logo công ty."
 }

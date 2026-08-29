@@ -49,9 +49,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "lightingsales.db")
 PRODUCT_IMAGE_DIR = os.path.join(BASE_DIR, "product_images")
 os.makedirs(PRODUCT_IMAGE_DIR, exist_ok=True)
+COMPANY_ASSET_DIR = os.path.join(BASE_DIR, "company_assets")
+os.makedirs(COMPANY_ASSET_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "2.6.0"
+APP_VERSION = "3.0.0"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -181,6 +183,19 @@ def save_product_image(uploaded_file, product_code):
     return os.path.join("product_images", filename)
 
 
+def save_company_logo(uploaded_file):
+    """Lưu logo công ty vào company_assets và trả về đường dẫn tương đối."""
+    if uploaded_file is None:
+        return ""
+    ext = os.path.splitext(uploaded_file.name)[1].lower() or ".png"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"company_logo_{timestamp}{ext}"
+    abs_path = os.path.join(COMPANY_ASSET_DIR, filename)
+    with open(abs_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return os.path.join("company_assets", filename)
+
+
 # ============================================================
 # 3. TẠO DATABASE
 # ============================================================
@@ -243,6 +258,7 @@ ensure_column("cong_trinh_new", "viec_tiep_theo", "TEXT DEFAULT ''")
 ensure_column("cong_trinh_new", "ngay_theo_doi", "TEXT DEFAULT ''")
 ensure_column("san_pham", "mo_ta", "TEXT DEFAULT ''")
 ensure_column("san_pham", "hinh_anh", "TEXT DEFAULT ''")
+ensure_column("cau_hinh_doanh_nghiep", "logo_path", "TEXT DEFAULT ''")
 
 
 # ============================================================
@@ -304,7 +320,8 @@ def load_data():
             sdt,
             email,
             website,
-            facebook
+            facebook,
+            logo_path
         FROM cau_hinh_doanh_nghiep
         WHERE id = 1
     """, conn)
@@ -748,138 +765,60 @@ if page == "📊  Tổng quan":
 
 if page == "👥  Khách hàng":
     page_header("Khách hàng", "Quản lý khách hàng, công ty, địa chỉ và phân loại đối tác.")
-
     st.markdown("## 👥 Quản lý khách hàng")
 
-    st.markdown("### ➕ Thêm khách hàng mới")
-
-    ten = st.text_input(
-        "Họ và tên *",
-        key="kh_ten"
-    )
-
-    thoai = st.text_input(
-        "Số điện thoại *",
-        key="kh_thoai"
-    )
-
-    ten_cong_ty = st.text_input(
-        "Tên công ty",
-        placeholder="Ví dụ: Công ty TNHH ABC",
-        key="kh_ten_cong_ty"
-    )
-
-    dia_chi_cong_ty = st.text_input(
-        "Địa chỉ công ty",
-        placeholder="Nhập địa chỉ công ty của khách hàng",
-        key="kh_dia_chi_cong_ty"
-    )
-
-    phan_loai_kh = st.selectbox(
-        "Phân loại khách hàng",
-        [
-            "Chủ đầu tư",
-            "Nhà thầu",
-            "Kiến trúc",
-            "Nội thất",
-            "Khách lẻ"
-        ],
-        key="kh_loai"
-    )
-
-    if st.button(
-        "➕ Thêm hồ sơ khách hàng",
-        type="primary"
-    ):
-
-        if not ten.strip() or not thoai.strip():
-
-            st.warning(
-                "⚠️ Vui lòng nhập đầy đủ tên và số điện thoại."
-            )
-
-        else:
-
-            try:
-
-                cursor.execute("""
-                    INSERT INTO khach_hang_goc
-                    (ten, thoai, ten_cong_ty, dia_chi_cong_ty, phan_loai_kh, ngay_tao)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (
-                    ten.strip(),
-                    thoai.strip(),
-                    ten_cong_ty.strip(),
-                    dia_chi_cong_ty.strip(),
-                    phan_loai_kh,
-                    datetime.now().strftime("%Y-%m-%d")
-                ))
-
-                conn.commit()
-
-                st.success(
-                    "🎉 Đã thêm khách hàng thành công!"
-                )
-
-                st.rerun()
-
-            except sqlite3.IntegrityError:
-
-                st.error(
-                    "❌ Số điện thoại này đã tồn tại!"
-                )
-
-    st.markdown("---")
+    with st.expander("➕ Thêm khách hàng mới", expanded=df_kh.empty):
+        ten = st.text_input("Họ và tên *", key="kh_ten")
+        thoai = st.text_input("Số điện thoại *", key="kh_thoai")
+        ten_cong_ty = st.text_input("Tên công ty", placeholder="Ví dụ: Công ty TNHH ABC", key="kh_ten_cong_ty")
+        dia_chi_cong_ty = st.text_input("Địa chỉ công ty", placeholder="Nhập địa chỉ công ty của khách hàng", key="kh_dia_chi_cong_ty")
+        phan_loai_kh = st.selectbox("Phân loại khách hàng", ["Chủ đầu tư", "Nhà thầu", "Kiến trúc", "Nội thất", "Khách lẻ"], key="kh_loai")
+        if st.button("➕ Thêm hồ sơ khách hàng", type="primary", key="add_customer_btn"):
+            if not ten.strip() or not thoai.strip():
+                st.warning("⚠️ Vui lòng nhập đầy đủ tên và số điện thoại.")
+            else:
+                try:
+                    cursor.execute("""INSERT INTO khach_hang_goc (ten, thoai, ten_cong_ty, dia_chi_cong_ty, phan_loai_kh, ngay_tao) VALUES (?, ?, ?, ?, ?, ?)""", (ten.strip(), thoai.strip(), ten_cong_ty.strip(), dia_chi_cong_ty.strip(), phan_loai_kh, datetime.now().strftime("%Y-%m-%d")))
+                    conn.commit(); st.success("🎉 Đã thêm khách hàng thành công!"); st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("❌ Số điện thoại này đã tồn tại!")
 
     st.markdown("### 📋 Danh sách khách hàng")
-
-    df_kh_display = df_kh.rename(columns={
-        "ten": "Họ và tên",
-        "thoai": "Số điện thoại",
-        "ten_cong_ty": "Công ty",
-        "dia_chi_cong_ty": "Địa chỉ công ty",
-        "phan_loai_kh": "Phân loại",
-        "ngay_tao": "Ngày tạo"
-    })
-
-    st.dataframe(
-        df_kh_display,
-        width="stretch",
-        hide_index=True
-    )
+    df_kh_display = df_kh.rename(columns={"ten":"Họ và tên","thoai":"Số điện thoại","ten_cong_ty":"Công ty","dia_chi_cong_ty":"Địa chỉ công ty","phan_loai_kh":"Phân loại","ngay_tao":"Ngày tạo"})
+    st.dataframe(df_kh_display, width="stretch", hide_index=True)
 
     if not df_kh.empty:
-
-        with st.expander(
-            "🗑️ Xóa khách hàng"
-        ):
-
-            kh_del_id = st.selectbox(
-                "Chọn khách hàng",
-                df_kh["id"].tolist(),
-                format_func=lambda x:
-                    f"ID {x} - "
-                    f"{df_kh.loc[df_kh['id'] == x, 'ten'].values[0]} "
-                    f"({df_kh.loc[df_kh['id'] == x, 'thoai'].values[0]})"
-            )
-
-            if st.button(
-                "❌ Xác nhận xóa",
-                type="primary"
-            ):
-
-                cursor.execute(
-                    "DELETE FROM khach_hang_goc WHERE id = ?",
-                    (kh_del_id,)
-                )
-
-                conn.commit()
-
-                st.success(
-                    "🎉 Đã xóa khách hàng!"
-                )
-
-                st.rerun()
+        with st.expander("✏️ Chỉnh sửa / cập nhật khách hàng"):
+            kh_edit_id = st.selectbox("Chọn khách hàng cần chỉnh sửa", df_kh["id"].tolist(), format_func=lambda x: f"ID {x} - {df_kh.loc[df_kh['id']==x,'ten'].values[0]} ({df_kh.loc[df_kh['id']==x,'thoai'].values[0]})", key="kh_edit_id")
+            kh_row = df_kh.loc[df_kh["id"] == kh_edit_id].iloc[0]
+            kh_types = ["Chủ đầu tư", "Nhà thầu", "Kiến trúc", "Nội thất", "Khách lẻ"]
+            current_type = str(kh_row.get("phan_loai_kh", "") or "")
+            type_index = kh_types.index(current_type) if current_type in kh_types else 0
+            e1,e2=st.columns(2)
+            with e1:
+                edit_ten=st.text_input("Họ và tên *", value=str(kh_row["ten"] or ""), key=f"edit_kh_ten_{kh_edit_id}")
+                edit_thoai=st.text_input("Số điện thoại *", value=str(kh_row["thoai"] or ""), key=f"edit_kh_phone_{kh_edit_id}")
+                edit_company=st.text_input("Tên công ty", value=str(kh_row.get("ten_cong_ty","") or ""), key=f"edit_kh_company_{kh_edit_id}")
+            with e2:
+                edit_address=st.text_input("Địa chỉ công ty", value=str(kh_row.get("dia_chi_cong_ty","") or ""), key=f"edit_kh_address_{kh_edit_id}")
+                edit_type=st.selectbox("Phân loại khách hàng", kh_types, index=type_index, key=f"edit_kh_type_{kh_edit_id}")
+                st.text_input("Ngày tạo", value=str(kh_row.get("ngay_tao","") or ""), disabled=True, key=f"edit_kh_created_{kh_edit_id}")
+            if st.button("💾 Cập nhật thông tin khách hàng", type="primary", key="update_customer_btn"):
+                if not edit_ten.strip() or not edit_thoai.strip():
+                    st.warning("⚠️ Họ tên và số điện thoại không được để trống.")
+                else:
+                    try:
+                        old_phone=str(kh_row["thoai"] or "").strip(); new_phone=edit_thoai.strip()
+                        cursor.execute("""UPDATE khach_hang_goc SET ten=?, thoai=?, ten_cong_ty=?, dia_chi_cong_ty=?, phan_loai_kh=? WHERE id=?""", (edit_ten.strip(),new_phone,edit_company.strip(),edit_address.strip(),edit_type,int(kh_edit_id)))
+                        if old_phone and new_phone != old_phone:
+                            cursor.execute("UPDATE cong_trinh_new SET thoai_khach=? WHERE thoai_khach=?", (new_phone,old_phone))
+                        conn.commit(); st.success("✅ Đã cập nhật thông tin khách hàng."); st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("❌ Số điện thoại này đang được dùng cho khách hàng khác.")
+        with st.expander("🗑️ Xóa khách hàng"):
+            kh_del_id=st.selectbox("Chọn khách hàng", df_kh["id"].tolist(), format_func=lambda x: f"ID {x} - {df_kh.loc[df_kh['id']==x,'ten'].values[0]} ({df_kh.loc[df_kh['id']==x,'thoai'].values[0]})", key="kh_delete_id")
+            if st.button("❌ Xác nhận xóa", type="primary", key="delete_customer_btn"):
+                cursor.execute("DELETE FROM khach_hang_goc WHERE id=?",(kh_del_id,)); conn.commit(); st.success("🎉 Đã xóa khách hàng!"); st.rerun()
 
 
 # ============================================================
@@ -1182,298 +1121,79 @@ if page == "🧾  Báo giá":
 
 if page == "📦  Sản phẩm":
     page_header("Sản phẩm", "Quản lý danh mục sản phẩm, giá bán, mô tả và hình ảnh.")
-
     st.markdown("## 📦 Kho sản phẩm chiếu sáng")
-
-    arr_danh_muc_den = [
-        "Downlight",
-        "Led dây",
-        "Thanh profile",
-        "Bộ nguồn",
-        "Đèn nam châm",
-        "Đèn trang trí",
-        "Khác"
-    ]
-
-    arr_hang_den = [
-        "Raynice",
-        "1962",
-        "Wullian",
-        "Khác"
-    ]
-
-    txt_tim_sp = st.text_input(
-        "🔎 Tìm sản phẩm",
-        placeholder="Nhập tên hoặc mã code"
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        cbo_danh_muc = st.selectbox(
-            "Danh mục",
-            ["Tất cả"] + arr_danh_muc_den
-        )
-
-    with col2:
-
-        cbo_hang = st.selectbox(
-            "Hãng sản xuất",
-            ["Tất cả"] + arr_hang_den
-        )
-
-    st.markdown("---")
-
-    st.markdown("### ➕ Thêm sản phẩm mới")
-    st.caption("Điền thông tin sản phẩm, mô tả và tải ảnh sản phẩm lên hệ thống.")
-
-
-    new_ma_code = st.text_input(
-        "Mã code sản phẩm *"
-    )
-
-    new_ten_sp = st.text_input(
-        "Tên sản phẩm *"
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        new_danh_muc = st.selectbox(
-            "Danh mục",
-            arr_danh_muc_den
-        )
-
-    with col2:
-
-        new_hang = st.selectbox(
-            "Hãng",
-            arr_hang_den
-        )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        new_dvt = st.selectbox(
-            "Đơn vị tính",
-            ["cái", "bộ", "mét"]
-        )
-
-    with col2:
-
-        new_gia_ban = st.number_input(
-            "Giá bán (VNĐ)",
-            min_value=0.0,
-            step=1000.0
-        )
-
-    new_mo_ta = st.text_area(
-        "Mô tả sản phẩm",
-        placeholder="Nhập thông số, đặc điểm, công suất, kích thước, màu sắc..."
-    )
-
-    new_hinh_anh = st.file_uploader(
-        "Hình ảnh sản phẩm",
-        type=["png", "jpg", "jpeg", "webp"],
-        help="Chọn 1 ảnh PNG/JPG/JPEG/WEBP cho sản phẩm."
-    )
-
-    if new_hinh_anh is not None:
-        st.image(new_hinh_anh, caption="Ảnh sản phẩm đã chọn", width=220)
-
-    new_ghi_chu = st.text_area(
-        "Ghi chú",
-        key="product_note"
-    )
-
-    if st.button(
-        "📦 Nhập sản phẩm vào kho",
-        type="primary"
-    ):
-
-        if not new_ma_code.strip() or not new_ten_sp.strip():
-
-            st.warning(
-                "⚠️ Vui lòng nhập mã và tên sản phẩm."
-            )
-
-        else:
-
-            try:
-
-                image_path = save_product_image(
-                    new_hinh_anh,
-                    new_ma_code.strip()
-                )
-
-                cursor.execute("""
-                    INSERT INTO san_pham
-                    (
-                        ma_code,
-                        ten_sp,
-                        danh_muc,
-                        hang,
-                        gia_ban,
-                        dvt,
-                        mo_ta,
-                        hinh_anh,
-                        ghi_chu
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    new_ma_code.strip().upper(),
-                    new_ten_sp.strip(),
-                    new_danh_muc,
-                    new_hang,
-                    new_gia_ban,
-                    new_dvt,
-                    new_mo_ta.strip(),
-                    image_path,
-                    new_ghi_chu.strip()
-                ))
-
-                conn.commit()
-
-                st.success(
-                    "🎉 Đã thêm sản phẩm!"
-                )
-
-                st.rerun()
-
-            except sqlite3.IntegrityError:
-
-                st.error(
-                    "❌ Mã sản phẩm đã tồn tại!"
-                )
-    st.markdown("---")
-
-    df_sp_display = df_sp.copy()
-
-    if cbo_danh_muc != "Tất cả":
-
-        df_sp_display = df_sp_display[
-            df_sp_display["danh_muc"] == cbo_danh_muc
-        ]
-
-    if cbo_hang != "Tất cả":
-
-        df_sp_display = df_sp_display[
-            df_sp_display["hang"] == cbo_hang
-        ]
-
+    arr_danh_muc_den=["Downlight","Led dây","Thanh profile","Bộ nguồn","Đèn nam châm","Đèn trang trí","Khác"]
+    arr_hang_den=["Raynice","1962","Wullian","Khác"]
+    arr_dvt=["cái","bộ","mét"]
+    txt_tim_sp=st.text_input("🔎 Tìm sản phẩm", placeholder="Nhập tên hoặc mã code", key="product_search")
+    f1,f2=st.columns(2)
+    with f1: cbo_danh_muc=st.selectbox("Danh mục",["Tất cả"]+arr_danh_muc_den,key="product_filter_category")
+    with f2: cbo_hang=st.selectbox("Hãng sản xuất",["Tất cả"]+arr_hang_den,key="product_filter_brand")
+    df_sp_filtered=df_sp.copy()
     if txt_tim_sp.strip():
-
-        search_val = txt_tim_sp.strip().lower()
-
-        df_sp_display = df_sp_display[
-            df_sp_display["ten_sp"]
-            .fillna("")
-            .str.lower()
-            .str.contains(search_val)
-            |
-            df_sp_display["ma_code"]
-            .fillna("")
-            .str.lower()
-            .str.contains(search_val)
-            |
-            df_sp_display["mo_ta"]
-            .fillna("")
-            .str.lower()
-            .str.contains(search_val)
-        ]
-
-    if not df_sp_display.empty:
-
-        df_display = df_sp_display.copy()
-
-        df_display["GIÁ BÁN"] = (
-            df_display["gia_ban"]
-            .fillna(0)
-            .apply(lambda x: f"{x:,.0f} đ")
-        )
-
-        df_display = df_display.rename(columns={
-            "ma_code": "Mã code",
-            "ten_sp": "Tên sản phẩm",
-            "danh_muc": "Danh mục",
-            "hang": "Hãng",
-            "dvt": "DVT",
-            "mo_ta": "Mô tả sản phẩm",
-            "ghi_chu": "Ghi chú"
-        })
-
-        df_table = df_display.drop(columns=["hinh_anh"], errors="ignore")
-
-        st.dataframe(
-            df_table,
-            width="stretch",
-            hide_index=True
-        )
-
-        products_with_images = df_sp_display[
-            df_sp_display["hinh_anh"].fillna("").astype(str).str.strip() != ""
-        ]
-
+        q=txt_tim_sp.strip().lower(); mask=(df_sp_filtered["ma_code"].fillna("").astype(str).str.lower().str.contains(q,na=False)|df_sp_filtered["ten_sp"].fillna("").astype(str).str.lower().str.contains(q,na=False)|df_sp_filtered["mo_ta"].fillna("").astype(str).str.lower().str.contains(q,na=False)); df_sp_filtered=df_sp_filtered[mask]
+    if cbo_danh_muc!="Tất cả": df_sp_filtered=df_sp_filtered[df_sp_filtered["danh_muc"]==cbo_danh_muc]
+    if cbo_hang!="Tất cả": df_sp_filtered=df_sp_filtered[df_sp_filtered["hang"]==cbo_hang]
+    st.markdown("### 📋 Danh sách sản phẩm")
+    if df_sp_filtered.empty: st.info("Chưa có sản phẩm phù hợp bộ lọc.")
+    else:
+        show_sp=df_sp_filtered[["id","ma_code","ten_sp","danh_muc","hang","gia_ban","dvt","mo_ta","ghi_chu"]].copy(); show_sp["gia_ban"]=show_sp["gia_ban"].fillna(0).apply(lambda x:f"{float(x):,.0f} đ"); show_sp.columns=["ID","Mã code","Tên sản phẩm","Danh mục","Hãng","Giá bán","ĐVT","Mô tả","Ghi chú"]; st.dataframe(show_sp,use_container_width=True,hide_index=True)
+        products_with_images=df_sp_filtered[df_sp_filtered["hinh_anh"].fillna("").astype(str).str.strip()!=""]
         if not products_with_images.empty:
             st.markdown("### 🖼️ Hình ảnh sản phẩm")
-            for _, product in products_with_images.iterrows():
-                image_abs_path = os.path.join(BASE_DIR, str(product["hinh_anh"]))
+            for _,product in products_with_images.iterrows():
+                image_abs_path=os.path.join(BASE_DIR,str(product["hinh_anh"]))
                 if os.path.isfile(image_abs_path):
-                    col_img, col_info = st.columns([1, 3])
-                    with col_img:
-                        st.image(image_abs_path, width=200)
+                    col_img,col_info=st.columns([1,3])
+                    with col_img: st.image(image_abs_path,width=200)
                     with col_info:
-                        st.markdown(
-                            f"**[{product['ma_code']}] {product['ten_sp']}**"
-                        )
-                        if str(product.get("mo_ta", "")).strip():
-                            st.write(str(product["mo_ta"]))
-                        st.caption(
-                            f"{product['danh_muc']} • {product['hang']} • "
-                            f"{float(product['gia_ban'] or 0):,.0f} đ/{product['dvt']}"
-                        )
+                        st.markdown(f"**[{product['ma_code']}] {product['ten_sp']}**")
+                        if str(product.get("mo_ta","") or "").strip(): st.write(str(product["mo_ta"]))
+                        st.caption(f"{product['danh_muc']} • {product['hang']} • {float(product['gia_ban'] or 0):,.0f} đ/{product['dvt']}")
                     st.markdown("---")
-
-    else:
-
-        st.info(
-            "Không tìm thấy sản phẩm."
-        )
-
+    with st.expander("➕ Thêm sản phẩm mới",expanded=df_sp.empty):
+        new_ma_code=st.text_input("Mã code sản phẩm *",key="new_product_code"); new_ten_sp=st.text_input("Tên sản phẩm *",key="new_product_name")
+        c1,c2=st.columns(2)
+        with c1: new_danh_muc=st.selectbox("Danh mục",arr_danh_muc_den,key="new_product_category")
+        with c2: new_hang=st.selectbox("Hãng",arr_hang_den,key="new_product_brand")
+        c1,c2=st.columns(2)
+        with c1: new_dvt=st.selectbox("Đơn vị tính",arr_dvt,key="new_product_unit")
+        with c2: new_gia_ban=st.number_input("Giá bán (VNĐ)",min_value=0.0,step=1000.0,key="new_product_price")
+        new_mo_ta=st.text_area("Mô tả sản phẩm",placeholder="Nhập thông số, đặc điểm, công suất, kích thước, màu sắc...",key="new_product_desc")
+        new_hinh_anh=st.file_uploader("Hình ảnh sản phẩm",type=["png","jpg","jpeg","webp"],key="new_product_image")
+        if new_hinh_anh is not None: st.image(new_hinh_anh,caption="Ảnh sản phẩm đã chọn",width=220)
+        new_ghi_chu=st.text_area("Ghi chú",key="product_note")
+        if st.button("📦 Nhập sản phẩm vào kho",type="primary",key="add_product_btn"):
+            if not new_ma_code.strip() or not new_ten_sp.strip(): st.warning("⚠️ Vui lòng nhập mã và tên sản phẩm.")
+            else:
+                try:
+                    image_path=save_product_image(new_hinh_anh,new_ma_code.strip()); cursor.execute("""INSERT INTO san_pham (ma_code,ten_sp,danh_muc,hang,gia_ban,dvt,mo_ta,hinh_anh,ghi_chu) VALUES (?,?,?,?,?,?,?,?,?)""",(new_ma_code.strip().upper(),new_ten_sp.strip(),new_danh_muc,new_hang,float(new_gia_ban),new_dvt,new_mo_ta.strip(),image_path,new_ghi_chu.strip())); conn.commit(); st.success("🎉 Đã thêm sản phẩm vào kho!"); st.rerun()
+                except sqlite3.IntegrityError: st.error("❌ Mã sản phẩm đã tồn tại.")
     if not df_sp.empty:
-
-        with st.expander(
-            "🗑️ Xóa sản phẩm"
-        ):
-
-            sp_del_id = st.selectbox(
-                "Chọn sản phẩm",
-                df_sp["id"].tolist(),
-                format_func=lambda x:
-                    f"[{df_sp.loc[df_sp['id'] == x, 'ma_code'].values[0]}] "
-                    f"{df_sp.loc[df_sp['id'] == x, 'ten_sp'].values[0]}"
-            )
-
-            if st.button(
-                "❌ Xóa sản phẩm",
-                type="primary"
-            ):
-
-                cursor.execute(
-                    "DELETE FROM san_pham WHERE id = ?",
-                    (sp_del_id,)
-                )
-
-                conn.commit()
-
-                st.success(
-                    "🎉 Đã xóa sản phẩm!"
-                )
-
-                st.rerun()
+        with st.expander("✏️ Chỉnh sửa / cập nhật sản phẩm"):
+            sp_edit_id=st.selectbox("Chọn sản phẩm cần chỉnh sửa",df_sp["id"].tolist(),format_func=lambda x:f"{df_sp.loc[df_sp['id']==x,'ma_code'].values[0]} - {df_sp.loc[df_sp['id']==x,'ten_sp'].values[0]}",key="sp_edit_id"); sp_row=df_sp.loc[df_sp["id"]==sp_edit_id].iloc[0]
+            cur_cat=str(sp_row.get("danh_muc","") or ""); cur_brand=str(sp_row.get("hang","") or ""); cur_unit=str(sp_row.get("dvt","") or ""); cat_idx=arr_danh_muc_den.index(cur_cat) if cur_cat in arr_danh_muc_den else len(arr_danh_muc_den)-1; brand_idx=arr_hang_den.index(cur_brand) if cur_brand in arr_hang_den else len(arr_hang_den)-1; unit_idx=arr_dvt.index(cur_unit) if cur_unit in arr_dvt else 0
+            e1,e2=st.columns(2)
+            with e1:
+                edit_code=st.text_input("Mã code sản phẩm *",value=str(sp_row["ma_code"] or ""),key=f"edit_sp_code_{sp_edit_id}"); edit_name=st.text_input("Tên sản phẩm *",value=str(sp_row["ten_sp"] or ""),key=f"edit_sp_name_{sp_edit_id}"); edit_category=st.selectbox("Danh mục",arr_danh_muc_den,index=cat_idx,key=f"edit_sp_cat_{sp_edit_id}"); edit_brand=st.selectbox("Hãng",arr_hang_den,index=brand_idx,key=f"edit_sp_brand_{sp_edit_id}")
+            with e2:
+                edit_unit=st.selectbox("Đơn vị tính",arr_dvt,index=unit_idx,key=f"edit_sp_unit_{sp_edit_id}"); edit_price=st.number_input("Giá bán (VNĐ)",min_value=0.0,step=1000.0,value=float(sp_row.get("gia_ban",0) or 0),key=f"edit_sp_price_{sp_edit_id}"); current_img=str(sp_row.get("hinh_anh","") or "")
+                if current_img:
+                    current_abs=os.path.join(BASE_DIR,current_img)
+                    if os.path.exists(current_abs): st.image(current_abs,caption="Ảnh hiện tại",width=180)
+            edit_desc=st.text_area("Mô tả sản phẩm",value=str(sp_row.get("mo_ta","") or ""),key=f"edit_sp_desc_{sp_edit_id}"); replacement_image=st.file_uploader("Thay ảnh sản phẩm (không chọn nếu muốn giữ ảnh hiện tại)",type=["png","jpg","jpeg","webp"],key=f"edit_sp_image_{sp_edit_id}"); edit_note=st.text_area("Ghi chú",value=str(sp_row.get("ghi_chu","") or ""),key=f"edit_sp_note_{sp_edit_id}")
+            if st.button("💾 Cập nhật thông tin sản phẩm",type="primary",key="update_product_btn"):
+                if not edit_code.strip() or not edit_name.strip(): st.warning("⚠️ Mã code và tên sản phẩm không được để trống.")
+                else:
+                    try:
+                        final_image=current_img
+                        if replacement_image is not None: final_image=save_product_image(replacement_image,edit_code.strip())
+                        cursor.execute("""UPDATE san_pham SET ma_code=?,ten_sp=?,danh_muc=?,hang=?,gia_ban=?,dvt=?,mo_ta=?,hinh_anh=?,ghi_chu=? WHERE id=?""",(edit_code.strip().upper(),edit_name.strip(),edit_category,edit_brand,float(edit_price),edit_unit,edit_desc.strip(),final_image,edit_note.strip(),int(sp_edit_id))); conn.commit(); st.success("✅ Đã cập nhật thông tin sản phẩm."); st.rerun()
+                    except sqlite3.IntegrityError: st.error("❌ Mã code này đang được dùng cho sản phẩm khác.")
+        with st.expander("🗑️ Xóa sản phẩm"):
+            sp_del_id=st.selectbox("Chọn sản phẩm cần xóa",df_sp["id"].tolist(),format_func=lambda x:f"{df_sp.loc[df_sp['id']==x,'ma_code'].values[0]} - {df_sp.loc[df_sp['id']==x,'ten_sp'].values[0]}",key="sp_delete_id")
+            if st.button("❌ Xác nhận xóa sản phẩm",type="primary",key="delete_product_btn"):
+                cursor.execute("DELETE FROM san_pham WHERE id=?",(sp_del_id,)); conn.commit(); st.success("🎉 Đã xóa sản phẩm!"); st.rerun()
 
 
 # ============================================================
@@ -1481,124 +1201,35 @@ if page == "📦  Sản phẩm":
 # ============================================================
 
 if page == "🏢  Thông tin công ty":
-    page_header("Thông tin công ty", "Thông tin doanh nghiệp sử dụng trên báo giá và hồ sơ CRM.")
-
+    page_header("Thông tin công ty", "Quản lý nhận diện doanh nghiệp để dùng cho báo giá, đơn hàng và hồ sơ dự án.")
     st.markdown("## 🏢 Thông tin doanh nghiệp")
-
     if not df_cty_saved.empty:
-
-        company = df_cty_saved.iloc[0]
-
-        cur_ten = company["ten_cty"]
-        cur_tru_so = company["tru_so"]
-        cur_vpdd = company["vpdd"]
-        cur_sdt = company["sdt"]
-        cur_email = company["email"]
-        cur_website = company["website"]
-        cur_facebook = company["facebook"]
-
+        company=df_cty_saved.iloc[0]; cur_ten=str(company.get("ten_cty","") or ""); cur_tru_so=str(company.get("tru_so","") or ""); cur_vpdd=str(company.get("vpdd","") or ""); cur_sdt=str(company.get("sdt","") or ""); cur_email=str(company.get("email","") or ""); cur_website=str(company.get("website","") or ""); cur_facebook=str(company.get("facebook","") or ""); cur_logo=str(company.get("logo_path","") or "")
     else:
-
-        cur_ten = ""
-        cur_tru_so = ""
-        cur_vpdd = ""
-        cur_sdt = ""
-        cur_email = ""
-        cur_website = ""
-        cur_facebook = ""
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        ten_cty = st.text_input(
-            "Tên công ty / pháp nhân *",
-            value=cur_ten
-        )
-
-        tru_so = st.text_input(
-            "Địa chỉ trụ sở chính",
-            value=cur_tru_so
-        )
-
-        vpdd = st.text_input(
-            "Văn phòng / Showroom",
-            value=cur_vpdd
-        )
-
-        sdt = st.text_input(
-            "Số điện thoại / Hotline",
-            value=cur_sdt
-        )
-
-    with col2:
-
-        email = st.text_input(
-            "Email",
-            value=cur_email
-        )
-
-        website = st.text_input(
-            "Website",
-            value=cur_website
-        )
-
-        facebook = st.text_input(
-            "Facebook / Fanpage",
-            value=cur_facebook
-        )
-
-    if st.button(
-        "💾 Lưu thông tin doanh nghiệp",
-        type="primary"
-    ):
-
-        if not ten_cty.strip():
-
-            st.warning(
-                "⚠️ Vui lòng nhập tên công ty."
-            )
-
-        else:
-
-            cursor.execute(
-                "DELETE FROM cau_hinh_doanh_nghiep"
-            )
-
-            cursor.execute("""
-                INSERT INTO cau_hinh_doanh_nghiep
-                (
-                    id,
-                    ten_cty,
-                    tru_so,
-                    vpdd,
-                    sdt,
-                    email,
-                    website,
-                    facebook
-                )
-                VALUES
-                (
-                    1,
-                    ?, ?, ?, ?, ?, ?, ?
-                )
-            """, (
-                ten_cty.strip(),
-                tru_so.strip(),
-                vpdd.strip(),
-                sdt.strip(),
-                email.strip(),
-                website.strip(),
-                facebook.strip()
-            ))
-
-            conn.commit()
-
-            st.success(
-                "🎉 Đã lưu thông tin doanh nghiệp!"
-            )
-
-            st.rerun()
+        cur_ten=cur_tru_so=cur_vpdd=cur_sdt=""; cur_email=cur_website=cur_facebook=cur_logo=""
+    brand_col,info_col=st.columns([0.8,2.2],gap="large")
+    with brand_col:
+        st.markdown("### 🖼️ Logo công ty")
+        if cur_logo:
+            logo_abs=os.path.join(BASE_DIR,cur_logo)
+            if os.path.exists(logo_abs): st.image(logo_abs,caption="Logo hiện tại",width=240)
+            else: st.caption("Logo đã lưu nhưng file hiện không còn ở thư mục CRM.")
+        else: st.info("Chưa có logo công ty.")
+        new_logo=st.file_uploader("Upload / thay Logo",type=["png","jpg","jpeg","webp"],help="Khuyến nghị PNG nền trong suốt để dùng đẹp trên báo giá.",key="company_logo_upload")
+        if new_logo is not None: st.image(new_logo,caption="Logo mới đã chọn",width=240)
+    with info_col:
+        c1,c2=st.columns(2)
+        with c1:
+            ten_cty=st.text_input("Tên công ty / pháp nhân *",value=cur_ten,key="company_name"); tru_so=st.text_input("Địa chỉ trụ sở chính",value=cur_tru_so,key="company_hq"); vpdd=st.text_input("Văn phòng / Showroom",value=cur_vpdd,key="company_office"); sdt=st.text_input("Số điện thoại / Hotline",value=cur_sdt,key="company_phone")
+        with c2:
+            email=st.text_input("Email",value=cur_email,key="company_email"); website=st.text_input("Website",value=cur_website,key="company_website"); facebook=st.text_input("Facebook / Fanpage",value=cur_facebook,key="company_facebook")
+        st.caption("Logo và thông tin này sẽ là nguồn dữ liệu chung cho báo giá/PDF và các module V3 sau này.")
+        if st.button("💾 Lưu / cập nhật thông tin doanh nghiệp",type="primary",key="save_company_btn"):
+            if not ten_cty.strip(): st.warning("⚠️ Vui lòng nhập tên công ty.")
+            else:
+                final_logo=cur_logo
+                if new_logo is not None: final_logo=save_company_logo(new_logo)
+                cursor.execute("""INSERT INTO cau_hinh_doanh_nghiep (id,ten_cty,tru_so,vpdd,sdt,email,website,facebook,logo_path) VALUES (1,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET ten_cty=excluded.ten_cty,tru_so=excluded.tru_so,vpdd=excluded.vpdd,sdt=excluded.sdt,email=excluded.email,website=excluded.website,facebook=excluded.facebook,logo_path=excluded.logo_path""",(ten_cty.strip(),tru_so.strip(),vpdd.strip(),sdt.strip(),email.strip(),website.strip(),facebook.strip(),final_logo)); conn.commit(); st.success("🎉 Đã cập nhật thông tin doanh nghiệp và Logo!"); st.rerun()
 
 
 # ============================================================
