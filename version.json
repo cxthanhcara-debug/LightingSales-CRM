@@ -1,6 +1,6 @@
 {
-  "version": "3.0.0",
+  "version": "3.0.1",
   "app_url": "https://raw.githubusercontent.com/cxthanhcara-debug/LightingSales-CRM/main/app.py",
   "sha256": "15888e48935f94f4b1f3e91bdb2a0605119349edb1fec61f474a97b8892801f9",
-  "notes": "v3.0.0 - Data Management & Company Branding: chỉnh sửa/cập nhật khách hàng, sản phẩm; giữ liên kết công trình khi đổi SĐT; upload/thay logo công ty."
+  "notes": "v3.0.1 - Product Images UX: kéo thả ảnh, chọn file, dán ảnh trực tiếp từ Clipboard khi thêm hoặc chỉnh sửa sản phẩm."
 }
