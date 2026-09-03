@@ -57,7 +57,7 @@ COMPANY_ASSET_DIR = os.path.join(BASE_DIR, "company_assets")
 os.makedirs(COMPANY_ASSET_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "3.0.2"
+APP_VERSION = "3.0.4"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -1147,32 +1147,34 @@ if page == "📦  Sản phẩm":
     arr_danh_muc_den=["Downlight","Led dây","Thanh profile","Bộ nguồn","Đèn nam châm","Đèn trang trí","Khác"]
     arr_hang_den=["Raynice","1962","Wullian","Khác"]
     arr_dvt=["cái","bộ","mét"]
-    txt_tim_sp=st.text_input("🔎 Tìm sản phẩm", placeholder="Nhập tên hoặc mã code", key="product_search")
-    f1,f2=st.columns(2)
-    with f1: cbo_danh_muc=st.selectbox("Danh mục",["Tất cả"]+arr_danh_muc_den,key="product_filter_category")
-    with f2: cbo_hang=st.selectbox("Hãng sản xuất",["Tất cả"]+arr_hang_den,key="product_filter_brand")
-    df_sp_filtered=df_sp.copy()
-    if txt_tim_sp.strip():
-        q=txt_tim_sp.strip().lower(); mask=(df_sp_filtered["ma_code"].fillna("").astype(str).str.lower().str.contains(q,na=False)|df_sp_filtered["ten_sp"].fillna("").astype(str).str.lower().str.contains(q,na=False)|df_sp_filtered["mo_ta"].fillna("").astype(str).str.lower().str.contains(q,na=False)); df_sp_filtered=df_sp_filtered[mask]
-    if cbo_danh_muc!="Tất cả": df_sp_filtered=df_sp_filtered[df_sp_filtered["danh_muc"]==cbo_danh_muc]
-    if cbo_hang!="Tất cả": df_sp_filtered=df_sp_filtered[df_sp_filtered["hang"]==cbo_hang]
-    st.markdown("### 📋 Danh sách sản phẩm")
-    if df_sp_filtered.empty: st.info("Chưa có sản phẩm phù hợp bộ lọc.")
-    else:
-        show_sp=df_sp_filtered[["id","ma_code","ten_sp","danh_muc","hang","gia_ban","dvt","mo_ta","ghi_chu"]].copy(); show_sp["gia_ban"]=show_sp["gia_ban"].fillna(0).apply(lambda x:f"{float(x):,.0f} đ"); show_sp.columns=["ID","Mã code","Tên sản phẩm","Danh mục","Hãng","Giá bán","ĐVT","Mô tả","Ghi chú"]; st.dataframe(show_sp,use_container_width=True,hide_index=True)
-        products_with_images=df_sp_filtered[df_sp_filtered["hinh_anh"].fillna("").astype(str).str.strip()!=""]
-        if not products_with_images.empty:
-            st.markdown("### 🖼️ Hình ảnh sản phẩm")
-            for _,product in products_with_images.iterrows():
-                image_abs_path=os.path.join(BASE_DIR,str(product["hinh_anh"]))
-                if os.path.isfile(image_abs_path):
-                    col_img,col_info=st.columns([1,3])
-                    with col_img: st.image(image_abs_path,width=200)
-                    with col_info:
-                        st.markdown(f"**[{product['ma_code']}] {product['ten_sp']}**")
-                        if str(product.get("mo_ta","") or "").strip(): st.write(str(product["mo_ta"]))
-                        st.caption(f"{product['danh_muc']} • {product['hang']} • {float(product['gia_ban'] or 0):,.0f} đ/{product['dvt']}")
-                    st.markdown("---")
+    with st.expander("📋 Tra cứu / Danh sách sản phẩm", expanded=False):
+        txt_tim_sp=st.text_input("🔎 Tìm sản phẩm", placeholder="Nhập tên hoặc mã code", key="product_search")
+        f1,f2=st.columns(2)
+        with f1: cbo_danh_muc=st.selectbox("Danh mục",["Tất cả"]+arr_danh_muc_den,key="product_filter_category")
+        with f2: cbo_hang=st.selectbox("Hãng sản xuất",["Tất cả"]+arr_hang_den,key="product_filter_brand")
+        df_sp_filtered=df_sp.copy()
+        if txt_tim_sp.strip():
+            q=txt_tim_sp.strip().lower(); mask=(df_sp_filtered["ma_code"].fillna("").astype(str).str.lower().str.contains(q,na=False)|df_sp_filtered["ten_sp"].fillna("").astype(str).str.lower().str.contains(q,na=False)|df_sp_filtered["mo_ta"].fillna("").astype(str).str.lower().str.contains(q,na=False)); df_sp_filtered=df_sp_filtered[mask]
+        if cbo_danh_muc!="Tất cả": df_sp_filtered=df_sp_filtered[df_sp_filtered["danh_muc"]==cbo_danh_muc]
+        if cbo_hang!="Tất cả": df_sp_filtered=df_sp_filtered[df_sp_filtered["hang"]==cbo_hang]
+        st.markdown("### 📋 Danh sách sản phẩm")
+        if df_sp_filtered.empty: st.info("Chưa có sản phẩm phù hợp bộ lọc.")
+        else:
+            show_sp=df_sp_filtered[["id","ma_code","ten_sp","danh_muc","hang","gia_ban","dvt","mo_ta","ghi_chu"]].copy(); show_sp["gia_ban"]=show_sp["gia_ban"].fillna(0).apply(lambda x:f"{float(x):,.0f} đ"); show_sp.columns=["ID","Mã code","Tên sản phẩm","Danh mục","Hãng","Giá bán","ĐVT","Mô tả","Ghi chú"]; st.dataframe(show_sp,use_container_width=True,hide_index=True)
+            products_with_images=df_sp_filtered[df_sp_filtered["hinh_anh"].fillna("").astype(str).str.strip()!=""]
+            if not products_with_images.empty:
+                st.markdown("### 🖼️ Hình ảnh sản phẩm")
+                for _,product in products_with_images.iterrows():
+                    image_abs_path=os.path.join(BASE_DIR,str(product["hinh_anh"]))
+                    if os.path.isfile(image_abs_path):
+                        col_img,col_info=st.columns([1,3])
+                        with col_img: st.image(image_abs_path,width=200)
+                        with col_info:
+                            st.markdown(f"**[{product['ma_code']}] {product['ten_sp']}**")
+                            if str(product.get("mo_ta","") or "").strip(): st.write(str(product["mo_ta"]))
+                            st.caption(f"{product['danh_muc']} • {product['hang']} • {float(product['gia_ban'] or 0):,.0f} đ/{product['dvt']}")
+                        st.markdown("---")
+
     with st.expander("➕ Thêm sản phẩm mới",expanded=df_sp.empty):
         new_ma_code=st.text_input("Mã code sản phẩm *",key="new_product_code"); new_ten_sp=st.text_input("Tên sản phẩm *",key="new_product_name")
         c1,c2=st.columns(2)

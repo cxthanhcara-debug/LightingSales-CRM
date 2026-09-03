@@ -1,6 +1,6 @@
 {
-  "version": "3.0.3",
+  "version": "3.0.4",
   "app_url": "https://raw.githubusercontent.com/cxthanhcara-debug/LightingSales-CRM/main/app.py",
-  "sha256": "426aed2ff6efe3fda22c2474fb019c6e61093587ffba3074109bf7553382417b",
-  "notes": "v3.0.3 - Compact Product UI: thu gọn khu tra cứu/danh sách/hình ảnh sản phẩm; mặc định đóng để phần thêm/chỉnh sửa sản phẩm dễ truy cập hơn."
+  "sha256": "3a2d612dbe454b9ca45745cdd34dcd6f644554cbc7ebace15b0e2d19606aecbe",
+  "notes": "v3.0.4 FIX - thu gọn mặc định khu Tra cứu/Danh sách/Hình ảnh sản phẩm; giữ nguyên thêm/chỉnh sửa/paste ảnh."
 }
