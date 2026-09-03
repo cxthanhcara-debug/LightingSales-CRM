@@ -1,6 +1,6 @@
 {
-  "version": "3.0.1",
+  "version": "3.0.2",
   "app_url": "https://raw.githubusercontent.com/cxthanhcara-debug/LightingSales-CRM/main/app.py",
-  "sha256": "15888e48935f94f4b1f3e91bdb2a0605119349edb1fec61f474a97b8892801f9",
-  "notes": "v3.0.1 - Product Images UX: kéo thả ảnh, chọn file, dán ảnh trực tiếp từ Clipboard khi thêm hoặc chỉnh sửa sản phẩm."
+  "sha256": "426aed2ff6efe3fda22c2474fb019c6e61093587ffba3074109bf7553382417b",
+  "notes": "v3.0.2 Hotfix - sửa APP_VERSION; thêm chọn/kéo thả ảnh và dán ảnh từ Clipboard cho thêm/chỉnh sửa sản phẩm; tự cài streamlit-paste-button nếu thiếu."
 }

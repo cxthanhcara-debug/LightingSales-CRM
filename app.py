@@ -13,32 +13,36 @@ import re
 import html
 import urllib.request
 import urllib.error
+import io
 from datetime import datetime, timedelta
 
 # ============================================================
 # 1. TỰ KIỂM TRA / CÀI STREAMLIT + PANDAS
 # ============================================================
 
-def install_package(package):
+def install_package(import_name, pip_name=None):
     try:
-        __import__(package)
+        __import__(import_name)
     except ImportError:
-        print(f"Đang cài {package}...")
+        package_name = pip_name or import_name
+        print(f"Đang cài {package_name}...")
         subprocess.check_call([
             sys.executable,
             "-m",
             "pip",
             "install",
-            package
+            package_name
         ])
 
 
 install_package("streamlit")
 install_package("pandas")
+install_package("streamlit_paste_button", "streamlit-paste-button")
 
 
 import pandas as pd
 import streamlit as st
+from streamlit_paste_button import paste_image_button
 
 
 # ============================================================
@@ -53,7 +57,7 @@ COMPANY_ASSET_DIR = os.path.join(BASE_DIR, "company_assets")
 os.makedirs(COMPANY_ASSET_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.2"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -181,6 +185,24 @@ def save_product_image(uploaded_file, product_code):
         f.write(uploaded_file.getbuffer())
 
     return os.path.join("product_images", filename)
+
+
+def save_pasted_product_image(pil_image, product_code):
+    """Lưu ảnh PIL dán từ Clipboard vào product_images và trả về đường dẫn tương đối."""
+    if pil_image is None:
+        return ""
+
+    safe_code = "".join(ch for ch in product_code.upper() if ch.isalnum() or ch in ("-", "_"))
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"{safe_code}_{timestamp}.png"
+    abs_path = os.path.join(PRODUCT_IMAGE_DIR, filename)
+
+    # Clipboard image có thể ở nhiều mode; chuyển RGBA/RGB để lưu PNG ổn định.
+    image_to_save = pil_image.copy()
+    if image_to_save.mode not in ("RGB", "RGBA"):
+        image_to_save = image_to_save.convert("RGBA")
+    image_to_save.save(abs_path, format="PNG")
+    return os.path.relpath(abs_path, BASE_DIR)
 
 
 def save_company_logo(uploaded_file):
@@ -1160,14 +1182,34 @@ if page == "📦  Sản phẩm":
         with c1: new_dvt=st.selectbox("Đơn vị tính",arr_dvt,key="new_product_unit")
         with c2: new_gia_ban=st.number_input("Giá bán (VNĐ)",min_value=0.0,step=1000.0,key="new_product_price")
         new_mo_ta=st.text_area("Mô tả sản phẩm",placeholder="Nhập thông số, đặc điểm, công suất, kích thước, màu sắc...",key="new_product_desc")
-        new_hinh_anh=st.file_uploader("Hình ảnh sản phẩm",type=["png","jpg","jpeg","webp"],key="new_product_image")
-        if new_hinh_anh is not None: st.image(new_hinh_anh,caption="Ảnh sản phẩm đã chọn",width=220)
+        st.markdown("**Hình ảnh sản phẩm**")
+        st.caption("Bạn có thể chọn file, kéo thả file ảnh vào khung bên dưới, hoặc copy ảnh rồi bấm nút Dán ảnh từ Clipboard.")
+        img_col1,img_col2=st.columns([1.5,1])
+        with img_col1:
+            new_hinh_anh=st.file_uploader("Chọn / kéo thả ảnh",type=["png","jpg","jpeg","webp"],key="new_product_image")
+        with img_col2:
+            new_paste_result=paste_image_button("📋 Dán ảnh từ Clipboard",key="new_product_paste")
+            if new_paste_result.image_data is not None:
+                st.session_state["new_product_pasted_image"] = new_paste_result.image_data.copy()
+        new_pasted_image=st.session_state.get("new_product_pasted_image")
+        if new_hinh_anh is not None:
+            st.image(new_hinh_anh,caption="Ảnh sản phẩm đã chọn",width=220)
+        elif new_pasted_image is not None:
+            st.image(new_pasted_image,caption="Ảnh đã dán từ Clipboard",width=220)
+            if st.button("🧹 Bỏ ảnh đã dán",key="clear_new_pasted_image"):
+                st.session_state.pop("new_product_pasted_image",None); st.rerun()
         new_ghi_chu=st.text_area("Ghi chú",key="product_note")
         if st.button("📦 Nhập sản phẩm vào kho",type="primary",key="add_product_btn"):
             if not new_ma_code.strip() or not new_ten_sp.strip(): st.warning("⚠️ Vui lòng nhập mã và tên sản phẩm.")
             else:
                 try:
-                    image_path=save_product_image(new_hinh_anh,new_ma_code.strip()); cursor.execute("""INSERT INTO san_pham (ma_code,ten_sp,danh_muc,hang,gia_ban,dvt,mo_ta,hinh_anh,ghi_chu) VALUES (?,?,?,?,?,?,?,?,?)""",(new_ma_code.strip().upper(),new_ten_sp.strip(),new_danh_muc,new_hang,float(new_gia_ban),new_dvt,new_mo_ta.strip(),image_path,new_ghi_chu.strip())); conn.commit(); st.success("🎉 Đã thêm sản phẩm vào kho!"); st.rerun()
+                    if new_hinh_anh is not None:
+                        image_path=save_product_image(new_hinh_anh,new_ma_code.strip())
+                    elif new_pasted_image is not None:
+                        image_path=save_pasted_product_image(new_pasted_image,new_ma_code.strip())
+                    else:
+                        image_path=""
+                    cursor.execute("""INSERT INTO san_pham (ma_code,ten_sp,danh_muc,hang,gia_ban,dvt,mo_ta,hinh_anh,ghi_chu) VALUES (?,?,?,?,?,?,?,?,?)""",(new_ma_code.strip().upper(),new_ten_sp.strip(),new_danh_muc,new_hang,float(new_gia_ban),new_dvt,new_mo_ta.strip(),image_path,new_ghi_chu.strip())); conn.commit(); st.session_state.pop("new_product_pasted_image",None); st.success("🎉 Đã thêm sản phẩm vào kho!"); st.rerun()
                 except sqlite3.IntegrityError: st.error("❌ Mã sản phẩm đã tồn tại.")
     if not df_sp.empty:
         with st.expander("✏️ Chỉnh sửa / cập nhật sản phẩm"):
@@ -1181,14 +1223,34 @@ if page == "📦  Sản phẩm":
                 if current_img:
                     current_abs=os.path.join(BASE_DIR,current_img)
                     if os.path.exists(current_abs): st.image(current_abs,caption="Ảnh hiện tại",width=180)
-            edit_desc=st.text_area("Mô tả sản phẩm",value=str(sp_row.get("mo_ta","") or ""),key=f"edit_sp_desc_{sp_edit_id}"); replacement_image=st.file_uploader("Thay ảnh sản phẩm (không chọn nếu muốn giữ ảnh hiện tại)",type=["png","jpg","jpeg","webp"],key=f"edit_sp_image_{sp_edit_id}"); edit_note=st.text_area("Ghi chú",value=str(sp_row.get("ghi_chu","") or ""),key=f"edit_sp_note_{sp_edit_id}")
+            edit_desc=st.text_area("Mô tả sản phẩm",value=str(sp_row.get("mo_ta","") or ""),key=f"edit_sp_desc_{sp_edit_id}")
+            st.markdown("**Thay hình ảnh sản phẩm**")
+            st.caption("Không chọn/dán ảnh mới nếu muốn giữ ảnh hiện tại.")
+            ei1,ei2=st.columns([1.5,1])
+            with ei1:
+                replacement_image=st.file_uploader("Chọn / kéo thả ảnh mới",type=["png","jpg","jpeg","webp"],key=f"edit_sp_image_{sp_edit_id}")
+            with ei2:
+                edit_paste_result=paste_image_button("📋 Dán ảnh từ Clipboard",key=f"edit_sp_paste_{sp_edit_id}")
+                if edit_paste_result.image_data is not None:
+                    st.session_state[f"edit_sp_pasted_image_{sp_edit_id}"] = edit_paste_result.image_data.copy()
+            edit_pasted_image=st.session_state.get(f"edit_sp_pasted_image_{sp_edit_id}")
+            if replacement_image is not None:
+                st.image(replacement_image,caption="Ảnh mới đã chọn",width=180)
+            elif edit_pasted_image is not None:
+                st.image(edit_pasted_image,caption="Ảnh mới dán từ Clipboard",width=180)
+                if st.button("🧹 Bỏ ảnh đã dán",key=f"clear_edit_pasted_{sp_edit_id}"):
+                    st.session_state.pop(f"edit_sp_pasted_image_{sp_edit_id}",None); st.rerun()
+            edit_note=st.text_area("Ghi chú",value=str(sp_row.get("ghi_chu","") or ""),key=f"edit_sp_note_{sp_edit_id}")
             if st.button("💾 Cập nhật thông tin sản phẩm",type="primary",key="update_product_btn"):
                 if not edit_code.strip() or not edit_name.strip(): st.warning("⚠️ Mã code và tên sản phẩm không được để trống.")
                 else:
                     try:
                         final_image=current_img
-                        if replacement_image is not None: final_image=save_product_image(replacement_image,edit_code.strip())
-                        cursor.execute("""UPDATE san_pham SET ma_code=?,ten_sp=?,danh_muc=?,hang=?,gia_ban=?,dvt=?,mo_ta=?,hinh_anh=?,ghi_chu=? WHERE id=?""",(edit_code.strip().upper(),edit_name.strip(),edit_category,edit_brand,float(edit_price),edit_unit,edit_desc.strip(),final_image,edit_note.strip(),int(sp_edit_id))); conn.commit(); st.success("✅ Đã cập nhật thông tin sản phẩm."); st.rerun()
+                        if replacement_image is not None:
+                            final_image=save_product_image(replacement_image,edit_code.strip())
+                        elif edit_pasted_image is not None:
+                            final_image=save_pasted_product_image(edit_pasted_image,edit_code.strip())
+                        cursor.execute("""UPDATE san_pham SET ma_code=?,ten_sp=?,danh_muc=?,hang=?,gia_ban=?,dvt=?,mo_ta=?,hinh_anh=?,ghi_chu=? WHERE id=?""",(edit_code.strip().upper(),edit_name.strip(),edit_category,edit_brand,float(edit_price),edit_unit,edit_desc.strip(),final_image,edit_note.strip(),int(sp_edit_id))); conn.commit(); st.session_state.pop(f"edit_sp_pasted_image_{sp_edit_id}",None); st.success("✅ Đã cập nhật thông tin sản phẩm."); st.rerun()
                     except sqlite3.IntegrityError: st.error("❌ Mã code này đang được dùng cho sản phẩm khác.")
         with st.expander("🗑️ Xóa sản phẩm"):
             sp_del_id=st.selectbox("Chọn sản phẩm cần xóa",df_sp["id"].tolist(),format_func=lambda x:f"{df_sp.loc[df_sp['id']==x,'ma_code'].values[0]} - {df_sp.loc[df_sp['id']==x,'ten_sp'].values[0]}",key="sp_delete_id")
