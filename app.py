@@ -57,7 +57,7 @@ COMPANY_ASSET_DIR = os.path.join(BASE_DIR, "company_assets")
 os.makedirs(COMPANY_ASSET_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "3.0.4"
+APP_VERSION = "3.0.5"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -1144,7 +1144,7 @@ if page == "🧾  Báo giá":
 if page == "📦  Sản phẩm":
     page_header("Sản phẩm", "Quản lý danh mục sản phẩm, giá bán, mô tả và hình ảnh.")
     st.markdown("## 📦 Kho sản phẩm chiếu sáng")
-    arr_danh_muc_den=["Downlight","Led dây","Thanh profile","Bộ nguồn","Đèn nam châm","Đèn trang trí","Khác"]
+    arr_danh_muc_den=["Downlight","Led dây","Thanh profile","Bộ nguồn","Đèn nam châm","Đèn trang trí","Đèn Steplight","Đèn gắn tường","Đèn Outdoor","Khác"]
     arr_hang_den=["Raynice","1962","Wullian","Khác"]
     arr_dvt=["cái","bộ","mét"]
     with st.expander("📋 Tra cứu / Danh sách sản phẩm", expanded=False):
