@@ -1,6 +1,6 @@
 {
-  "version": "3.2.2",
+  "version": "3.3.0",
   "app_url": "https://raw.githubusercontent.com/cxthanhcara-debug/LightingSales-CRM/main/app.py",
-  "sha256": "062b37ef39edb6c1573f42daadaa2fb780bc8c67a5ff586c08a734a2c24c50ac",
-  "notes": "v3.2.2 - Fix Dashboard Activity: công việc đã hoàn thành tự ẩn; Tổng quan chỉ đọc Activity trạng thái Đang làm; xử lý theo Activity ID để tránh treo công việc cũ."
+  "sha256": "5d3cc37e854b31ef8da43b2f0cda1c14eaaeadf3b87d55e37bb8822591aae905",
+  "notes": "v3.3.0 - Quick Quotation Builder: chọn công trình và sản phẩm từ kho, SKU riêng từng dòng, số lượng, đơn giá, chiết khấu, VAT, tính tổng, lưu snapshot báo giá và quản lý trạng thái."
 }

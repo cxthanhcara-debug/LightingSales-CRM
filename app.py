@@ -57,7 +57,7 @@ COMPANY_ASSET_DIR = os.path.join(BASE_DIR, "company_assets")
 os.makedirs(COMPANY_ASSET_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "3.2.2"
+APP_VERSION = "3.3.0"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -297,6 +297,45 @@ CREATE TABLE IF NOT EXISTS cong_trinh_hoat_dong (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS bao_gia (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    so_bao_gia TEXT UNIQUE NOT NULL,
+    cong_trinh_id INTEGER,
+    ten_du_an_snapshot TEXT DEFAULT '',
+    thoai_khach TEXT DEFAULT '',
+    ten_khach_snapshot TEXT DEFAULT '',
+    ngay_bao_gia TEXT DEFAULT '',
+    trang_thai TEXT DEFAULT 'Nháp',
+    ghi_chu TEXT DEFAULT '',
+    vat_percent REAL DEFAULT 0,
+    tong_truoc_thue REAL DEFAULT 0,
+    tien_vat REAL DEFAULT 0,
+    tong_thanh_toan REAL DEFAULT 0,
+    ngay_tao TEXT DEFAULT '',
+    ngay_cap_nhat TEXT DEFAULT ''
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS bao_gia_chi_tiet (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bao_gia_id INTEGER NOT NULL,
+    san_pham_id INTEGER,
+    sku TEXT DEFAULT '',
+    ma_code_snapshot TEXT DEFAULT '',
+    ten_sp_snapshot TEXT DEFAULT '',
+    mo_ta_snapshot TEXT DEFAULT '',
+    hang_snapshot TEXT DEFAULT '',
+    dvt_snapshot TEXT DEFAULT '',
+    so_luong REAL DEFAULT 1,
+    don_gia REAL DEFAULT 0,
+    chiet_khau_percent REAL DEFAULT 0,
+    thanh_tien REAL DEFAULT 0,
+    ghi_chu TEXT DEFAULT ''
+)
+""")
+
 conn.commit()
 
 # Nâng cấp database cũ: chỉ thêm cột, tuyệt đối không xóa dữ liệu hiện có.
@@ -465,6 +504,38 @@ def sync_project_next_action(project_id):
         int(project_id)
     ))
     conn.commit()
+
+
+
+def generate_quote_number():
+    """Sinh số báo giá dễ đọc và không trùng."""
+    today_code = datetime.now().strftime("%y%m%d")
+    row = cursor.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM bao_gia").fetchone()
+    next_id = int(row[0] or 1)
+    return f"QT-{today_code}-{next_id:04d}"
+
+
+def money_vnd(value):
+    try:
+        return f"{float(value):,.0f} đ"
+    except Exception:
+        return "0 đ"
+
+
+def get_project_customer(project_id):
+    """Lấy snapshot công trình + khách hàng để lưu độc lập vào báo giá."""
+    row = cursor.execute("""
+        SELECT
+            c.id,
+            c.ten_du_an,
+            COALESCE(c.thoai_khach, ''),
+            COALESCE(k.ten, ''),
+            COALESCE(k.ten_cong_ty, '')
+        FROM cong_trinh_new c
+        LEFT JOIN khach_hang_goc k ON k.thoai = c.thoai_khach
+        WHERE c.id=?
+    """, (int(project_id),)).fetchone()
+    return row
 
 
 # ============================================================
@@ -1691,48 +1762,541 @@ if page == "🏗️  Công trình":
 # ============================================================
 
 if page == "🧾  Báo giá":
-    page_header("Báo giá", "Tạo và quản lý báo giá theo khách hàng, công trình và sản phẩm.")
-
-    st.markdown("## 🧾 Báo giá")
-
-    if (
-        not df_cty_saved.empty
-        and str(df_cty_saved.iloc[0]["ten_cty"]).strip()
-    ):
-
-        company = df_cty_saved.iloc[0]
-
-        st.success(
-            f"🏢 Đơn vị xuất báo giá: "
-            f"{company['ten_cty']}"
-        )
-
-        st.write(
-            f"📍 Địa chỉ: {company['tru_so']}"
-        )
-
-        st.write(
-            f"📞 Hotline: {company['sdt']}"
-        )
-
-        st.write(
-            f"📧 Email: {company['email']}"
-        )
-
-    else:
-
-        st.warning(
-            "⚠️ Chưa cấu hình thông tin doanh nghiệp."
-        )
-
-    st.markdown("---")
-
-    st.info(
-        "Module báo giá hiện đang là khung cơ bản. "
-        "Có thể mở rộng thêm chọn khách hàng, "
-        "chọn sản phẩm, số lượng, chiết khấu, VAT "
-        "và xuất PDF."
+    page_header(
+        "Báo giá",
+        "Tạo báo giá nhanh từ kho sản phẩm, nhập SKU, số lượng, chiết khấu và lưu theo công trình."
     )
+
+    # --------------------------------------------------------
+    # QUOTATION KPIs
+    # --------------------------------------------------------
+    quote_stats = cursor.execute("""
+        SELECT
+            COUNT(*) AS total_quotes,
+            SUM(CASE WHEN trang_thai='Nháp' THEN 1 ELSE 0 END) AS draft_quotes,
+            COALESCE(SUM(tong_thanh_toan), 0) AS total_value
+        FROM bao_gia
+    """).fetchone()
+
+    qk1, qk2, qk3, qk4 = st.columns(4)
+    with qk1:
+        kpi_card("🧾", "TỔNG BÁO GIÁ", int(quote_stats[0] or 0), "Đã lưu trong CRM")
+    with qk2:
+        kpi_card("📝", "BẢN NHÁP", int(quote_stats[1] or 0), "Đang chỉnh sửa")
+    with qk3:
+        kpi_card("💰", "TỔNG GIÁ TRỊ", money_vnd(quote_stats[2] or 0), "Giá trị báo giá")
+    with qk4:
+        product_count = int(cursor.execute("SELECT COUNT(*) FROM san_pham").fetchone()[0] or 0)
+        kpi_card("📦", "SẢN PHẨM KHO", product_count, "Sẵn sàng chọn")
+
+    # --------------------------------------------------------
+    # SESSION CART
+    # --------------------------------------------------------
+    if "quote_lines_v330" not in st.session_state:
+        st.session_state["quote_lines_v330"] = []
+
+    quote_lines = st.session_state["quote_lines_v330"]
+
+    # --------------------------------------------------------
+    # NEW QUICK QUOTE
+    # --------------------------------------------------------
+    with st.expander("➕ Tạo báo giá nhanh", expanded=True):
+        if df_ct.empty:
+            st.warning("Chưa có công trình. Hãy tạo Công trình trước khi lập báo giá.")
+        elif df_sp.empty:
+            st.warning("Kho sản phẩm đang trống. Hãy thêm sản phẩm trước khi lập báo giá.")
+        else:
+            project_ids = df_ct["id"].astype(int).tolist()
+            quote_project_id = st.selectbox(
+                "Công trình / Deal *",
+                project_ids,
+                format_func=lambda x: f"#{x} - {df_ct.loc[df_ct['id']==x, 'ten_du_an'].iloc[0]}",
+                key="quote_project_id_v330"
+            )
+
+            customer_row = get_project_customer(quote_project_id)
+            project_name = str(customer_row[1] or "") if customer_row else ""
+            customer_phone = str(customer_row[2] or "") if customer_row else ""
+            customer_name = str(customer_row[3] or "") if customer_row else ""
+            customer_company = str(customer_row[4] or "") if customer_row else ""
+
+            h1, h2, h3 = st.columns([1.2, 1.5, 1.2])
+            with h1:
+                quote_number_preview = generate_quote_number()
+                st.text_input(
+                    "Số báo giá",
+                    value=quote_number_preview,
+                    disabled=True,
+                    key="quote_number_preview_v330"
+                )
+            with h2:
+                quote_customer_display = customer_name
+                if customer_company:
+                    quote_customer_display += f" / {customer_company}"
+                st.text_input(
+                    "Khách hàng",
+                    value=quote_customer_display or "Chưa có tên khách hàng",
+                    disabled=True,
+                    key="quote_customer_display_v330"
+                )
+            with h3:
+                quote_date = st.date_input(
+                    "Ngày báo giá",
+                    value=datetime.now().date(),
+                    key="quote_date_v330"
+                )
+
+            st.caption(f"📞 {customer_phone or 'Chưa có SĐT'}  •  🏗️ {project_name}")
+
+            st.markdown("#### 📦 Thêm sản phẩm từ Kho")
+
+            add1, add2 = st.columns([2.4, 1])
+            with add1:
+                product_ids = df_sp["id"].astype(int).tolist()
+                selected_product_id = st.selectbox(
+                    "Tìm / chọn sản phẩm",
+                    product_ids,
+                    format_func=lambda x: (
+                        f"{df_sp.loc[df_sp['id']==x, 'ma_code'].iloc[0]} | "
+                        f"{df_sp.loc[df_sp['id']==x, 'ten_sp'].iloc[0]} | "
+                        f"{df_sp.loc[df_sp['id']==x, 'hang'].iloc[0]}"
+                    ),
+                    key="quote_product_select_v330"
+                )
+            selected_product = df_sp[df_sp["id"] == selected_product_id].iloc[0]
+
+            with add2:
+                sku_input = st.text_input(
+                    "SKU",
+                    value="",
+                    placeholder="Nhập SKU cho dòng báo giá",
+                    key=f"quote_sku_{selected_product_id}"
+                )
+
+            p1, p2, p3, p4 = st.columns([1, 1.2, 1, 1.2])
+            with p1:
+                qty_input = st.number_input(
+                    "Số lượng",
+                    min_value=0.01,
+                    value=1.0,
+                    step=1.0,
+                    key=f"quote_qty_{selected_product_id}"
+                )
+            with p2:
+                price_input = st.number_input(
+                    "Đơn giá",
+                    min_value=0.0,
+                    value=float(selected_product["gia_ban"] or 0),
+                    step=10000.0,
+                    format="%.0f",
+                    key=f"quote_price_{selected_product_id}"
+                )
+            with p3:
+                discount_input = st.number_input(
+                    "CK %",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=0.0,
+                    step=1.0,
+                    key=f"quote_discount_{selected_product_id}"
+                )
+            with p4:
+                line_total_preview = float(qty_input) * float(price_input) * (1 - float(discount_input) / 100)
+                st.metric("Thành tiền", money_vnd(line_total_preview))
+
+            desc_input = st.text_area(
+                "Mô tả / Thông số",
+                value=str(selected_product["mo_ta"] or ""),
+                height=80,
+                key=f"quote_desc_{selected_product_id}"
+            )
+            line_note = st.text_input(
+                "Ghi chú dòng sản phẩm",
+                value="",
+                placeholder="Ví dụ: 3000K / CRI90 / Beam 24° / Finish Black",
+                key=f"quote_line_note_{selected_product_id}"
+            )
+
+            if st.button("➕ Thêm vào báo giá", type="primary", key="quote_add_line_v330"):
+                st.session_state["quote_lines_v330"].append({
+                    "line_key": f"{datetime.now().timestamp()}_{selected_product_id}",
+                    "san_pham_id": int(selected_product_id),
+                    "SKU": sku_input.strip(),
+                    "Mã SP": str(selected_product["ma_code"] or ""),
+                    "Tên sản phẩm": str(selected_product["ten_sp"] or ""),
+                    "Hãng": str(selected_product["hang"] or ""),
+                    "Mô tả / Thông số": desc_input.strip(),
+                    "ĐVT": str(selected_product["dvt"] or "cái"),
+                    "SL": float(qty_input),
+                    "Đơn giá": float(price_input),
+                    "CK %": float(discount_input),
+                    "Ghi chú": line_note.strip(),
+                })
+                st.success("Đã thêm sản phẩm vào báo giá.")
+                st.rerun()
+
+            st.markdown("---")
+            st.markdown("#### 🧾 Chi tiết báo giá")
+
+            if not quote_lines:
+                st.info("Chưa có sản phẩm. Chọn sản phẩm từ Kho ở phía trên và bấm “Thêm vào báo giá”.")
+            else:
+                # Convert current session lines to editable table.
+                editor_rows = []
+                for idx, line in enumerate(quote_lines, start=1):
+                    amount = float(line["SL"]) * float(line["Đơn giá"]) * (1 - float(line["CK %"]) / 100)
+                    editor_rows.append({
+                        "Xóa": False,
+                        "STT": idx,
+                        "SKU": line["SKU"],
+                        "Mã SP": line["Mã SP"],
+                        "Tên sản phẩm": line["Tên sản phẩm"],
+                        "Hãng": line["Hãng"],
+                        "Mô tả / Thông số": line["Mô tả / Thông số"],
+                        "ĐVT": line["ĐVT"],
+                        "SL": float(line["SL"]),
+                        "Đơn giá": float(line["Đơn giá"]),
+                        "CK %": float(line["CK %"]),
+                        "Thành tiền": amount,
+                        "Ghi chú": line["Ghi chú"],
+                    })
+
+                quote_editor_df = pd.DataFrame(editor_rows)
+
+                edited_quote_df = st.data_editor(
+                    quote_editor_df,
+                    width="stretch",
+                    hide_index=True,
+                    disabled=["STT", "Mã SP", "Tên sản phẩm", "Hãng", "ĐVT", "Thành tiền"],
+                    column_config={
+                        "Xóa": st.column_config.CheckboxColumn("Xóa"),
+                        "STT": st.column_config.NumberColumn("STT", width="small"),
+                        "SKU": st.column_config.TextColumn("SKU", width="medium"),
+                        "Mã SP": st.column_config.TextColumn("Mã SP", width="medium"),
+                        "Tên sản phẩm": st.column_config.TextColumn("Tên sản phẩm", width="large"),
+                        "Mô tả / Thông số": st.column_config.TextColumn("Mô tả / Thông số", width="large"),
+                        "SL": st.column_config.NumberColumn("SL", min_value=0.01, step=1.0),
+                        "Đơn giá": st.column_config.NumberColumn("Đơn giá", min_value=0, step=10000, format="%.0f"),
+                        "CK %": st.column_config.NumberColumn("CK %", min_value=0, max_value=100, step=1),
+                        "Thành tiền": st.column_config.NumberColumn("Thành tiền", format="%.0f"),
+                    },
+                    key="quote_lines_editor_v330"
+                )
+
+                # Save edits back into session state before calculations.
+                updated_lines = []
+                delete_indexes = []
+                for i, row in edited_quote_df.iterrows():
+                    if bool(row.get("Xóa", False)):
+                        delete_indexes.append(i)
+                        continue
+                    original = quote_lines[i]
+                    updated_lines.append({
+                        "line_key": original["line_key"],
+                        "san_pham_id": original["san_pham_id"],
+                        "SKU": str(row.get("SKU", "") or "").strip(),
+                        "Mã SP": original["Mã SP"],
+                        "Tên sản phẩm": original["Tên sản phẩm"],
+                        "Hãng": original["Hãng"],
+                        "Mô tả / Thông số": str(row.get("Mô tả / Thông số", "") or "").strip(),
+                        "ĐVT": original["ĐVT"],
+                        "SL": max(float(row.get("SL", 0) or 0), 0.01),
+                        "Đơn giá": max(float(row.get("Đơn giá", 0) or 0), 0.0),
+                        "CK %": min(max(float(row.get("CK %", 0) or 0), 0.0), 100.0),
+                        "Ghi chú": str(row.get("Ghi chú", "") or "").strip(),
+                    })
+
+                if delete_indexes:
+                    if st.button("🗑️ Xóa các dòng đã chọn", key="quote_delete_rows_v330"):
+                        st.session_state["quote_lines_v330"] = updated_lines
+                        st.success("Đã xóa dòng sản phẩm.")
+                        st.rerun()
+                else:
+                    st.session_state["quote_lines_v330"] = updated_lines
+
+                # Recalculate using edited values.
+                subtotal = sum(
+                    float(x["SL"]) * float(x["Đơn giá"]) * (1 - float(x["CK %"]) / 100)
+                    for x in updated_lines
+                )
+
+                total1, total2 = st.columns([2, 1])
+                with total1:
+                    quote_note = st.text_area(
+                        "Ghi chú báo giá",
+                        placeholder="Điều kiện giao hàng, thời gian hiệu lực, ghi chú cho khách hàng...",
+                        key="quote_note_v330"
+                    )
+                with total2:
+                    vat_percent = st.number_input(
+                        "VAT %",
+                        min_value=0.0,
+                        max_value=20.0,
+                        value=8.0,
+                        step=1.0,
+                        key="quote_vat_v330"
+                    )
+                    vat_amount = subtotal * float(vat_percent) / 100
+                    grand_total = subtotal + vat_amount
+                    st.write(f"**Tạm tính:** {money_vnd(subtotal)}")
+                    st.write(f"**VAT ({vat_percent:g}%):** {money_vnd(vat_amount)}")
+                    st.markdown(f"### Tổng cộng: {money_vnd(grand_total)}")
+
+                save1, save2 = st.columns([1, 1])
+                with save1:
+                    if st.button(
+                        "💾 Lưu báo giá",
+                        type="primary",
+                        use_container_width=True,
+                        key="quote_save_v330"
+                    ):
+                        final_lines = st.session_state.get("quote_lines_v330", [])
+                        if not final_lines:
+                            st.warning("Báo giá phải có ít nhất 1 sản phẩm.")
+                        else:
+                            quote_no = generate_quote_number()
+                            now_text = datetime.now().strftime("%d/%m/%Y %H:%M")
+                            cursor.execute("""
+                                INSERT INTO bao_gia
+                                (
+                                    so_bao_gia, cong_trinh_id, ten_du_an_snapshot,
+                                    thoai_khach, ten_khach_snapshot, ngay_bao_gia,
+                                    trang_thai, ghi_chu, vat_percent,
+                                    tong_truoc_thue, tien_vat, tong_thanh_toan,
+                                    ngay_tao, ngay_cap_nhat
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, 'Nháp', ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                quote_no,
+                                int(quote_project_id),
+                                project_name,
+                                customer_phone,
+                                customer_name or customer_company,
+                                quote_date.strftime("%d/%m/%Y"),
+                                quote_note.strip(),
+                                float(vat_percent),
+                                float(subtotal),
+                                float(vat_amount),
+                                float(grand_total),
+                                now_text,
+                                now_text
+                            ))
+                            quote_id = int(cursor.lastrowid)
+
+                            for line in final_lines:
+                                line_amount = (
+                                    float(line["SL"])
+                                    * float(line["Đơn giá"])
+                                    * (1 - float(line["CK %"]) / 100)
+                                )
+                                cursor.execute("""
+                                    INSERT INTO bao_gia_chi_tiet
+                                    (
+                                        bao_gia_id, san_pham_id, sku,
+                                        ma_code_snapshot, ten_sp_snapshot,
+                                        mo_ta_snapshot, hang_snapshot, dvt_snapshot,
+                                        so_luong, don_gia, chiet_khau_percent,
+                                        thanh_tien, ghi_chu
+                                    )
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """, (
+                                    quote_id,
+                                    int(line["san_pham_id"]),
+                                    line["SKU"],
+                                    line["Mã SP"],
+                                    line["Tên sản phẩm"],
+                                    line["Mô tả / Thông số"],
+                                    line["Hãng"],
+                                    line["ĐVT"],
+                                    float(line["SL"]),
+                                    float(line["Đơn giá"]),
+                                    float(line["CK %"]),
+                                    float(line_amount),
+                                    line["Ghi chú"]
+                                ))
+
+                            # Project value follows latest quotation value.
+                            cursor.execute("""
+                                UPDATE cong_trinh_new
+                                SET gia_tri_du_kien=?
+                                WHERE id=?
+                            """, (float(grand_total), int(quote_project_id)))
+
+                            conn.commit()
+                            st.session_state["quote_lines_v330"] = []
+                            st.success(f"Đã lưu báo giá {quote_no} — {money_vnd(grand_total)}")
+                            st.rerun()
+
+                with save2:
+                    if st.button(
+                        "🧹 Xóa toàn bộ sản phẩm đang chọn",
+                        use_container_width=True,
+                        key="quote_clear_all_v330"
+                    ):
+                        st.session_state["quote_lines_v330"] = []
+                        st.rerun()
+
+    # --------------------------------------------------------
+    # SAVED QUOTATIONS
+    # --------------------------------------------------------
+    st.markdown("### 📚 Báo giá đã lưu")
+    saved_quotes = pd.read_sql_query("""
+        SELECT
+            id,
+            so_bao_gia,
+            ten_du_an_snapshot,
+            ten_khach_snapshot,
+            ngay_bao_gia,
+            trang_thai,
+            vat_percent,
+            tong_thanh_toan,
+            ngay_tao
+        FROM bao_gia
+        ORDER BY id DESC
+    """, conn)
+
+    if saved_quotes.empty:
+        st.info("Chưa có báo giá nào được lưu.")
+    else:
+        sq1, sq2 = st.columns([2, 1])
+        with sq1:
+            quote_search = st.text_input(
+                "🔎 Tìm báo giá",
+                placeholder="Số báo giá / Công trình / Khách hàng",
+                key="quote_search_v330"
+            )
+        with sq2:
+            quote_status_filter = st.selectbox(
+                "Trạng thái",
+                ["Tất cả", "Nháp", "Đã gửi", "Đã chốt", "Hủy"],
+                key="quote_status_filter_v330"
+            )
+
+        quote_view = saved_quotes.copy()
+        if quote_search.strip():
+            mask = (
+                quote_view["so_bao_gia"].fillna("").str.contains(quote_search, case=False, na=False)
+                | quote_view["ten_du_an_snapshot"].fillna("").str.contains(quote_search, case=False, na=False)
+                | quote_view["ten_khach_snapshot"].fillna("").str.contains(quote_search, case=False, na=False)
+            )
+            quote_view = quote_view[mask]
+
+        if quote_status_filter != "Tất cả":
+            quote_view = quote_view[quote_view["trang_thai"] == quote_status_filter]
+
+        display_quotes = quote_view[
+            [
+                "id", "so_bao_gia", "ten_du_an_snapshot",
+                "ten_khach_snapshot", "ngay_bao_gia",
+                "trang_thai", "tong_thanh_toan"
+            ]
+        ].copy()
+        display_quotes["tong_thanh_toan"] = display_quotes["tong_thanh_toan"].apply(money_vnd)
+        display_quotes.columns = [
+            "ID", "Số báo giá", "Công trình",
+            "Khách hàng", "Ngày", "Trạng thái", "Tổng cộng"
+        ]
+        st.dataframe(display_quotes, width="stretch", hide_index=True)
+
+        with st.expander("🔍 Xem chi tiết / cập nhật trạng thái báo giá"):
+            quote_ids = quote_view["id"].astype(int).tolist()
+            if not quote_ids:
+                st.info("Không có báo giá phù hợp bộ lọc.")
+            else:
+                selected_quote_id = st.selectbox(
+                    "Chọn báo giá",
+                    quote_ids,
+                    format_func=lambda x: (
+                        f"{quote_view.loc[quote_view['id']==x, 'so_bao_gia'].iloc[0]} | "
+                        f"{quote_view.loc[quote_view['id']==x, 'ten_du_an_snapshot'].iloc[0]}"
+                    ),
+                    key="saved_quote_select_v330"
+                )
+
+                quote_header = cursor.execute("""
+                    SELECT
+                        so_bao_gia, ten_du_an_snapshot, ten_khach_snapshot,
+                        ngay_bao_gia, trang_thai, ghi_chu,
+                        vat_percent, tong_truoc_thue, tien_vat, tong_thanh_toan
+                    FROM bao_gia
+                    WHERE id=?
+                """, (int(selected_quote_id),)).fetchone()
+
+                detail_df = pd.read_sql_query("""
+                    SELECT
+                        sku,
+                        ma_code_snapshot,
+                        ten_sp_snapshot,
+                        hang_snapshot,
+                        mo_ta_snapshot,
+                        dvt_snapshot,
+                        so_luong,
+                        don_gia,
+                        chiet_khau_percent,
+                        thanh_tien,
+                        ghi_chu
+                    FROM bao_gia_chi_tiet
+                    WHERE bao_gia_id=?
+                    ORDER BY id ASC
+                """, conn, params=(int(selected_quote_id),))
+
+                st.markdown(
+                    f"#### {quote_header[0]} — {quote_header[1]}"
+                )
+                st.caption(
+                    f"Khách hàng: {quote_header[2] or '—'} • "
+                    f"Ngày: {quote_header[3]} • "
+                    f"Trạng thái: {quote_header[4]}"
+                )
+
+                if not detail_df.empty:
+                    detail_show = detail_df.copy()
+                    detail_show.columns = [
+                        "SKU", "Mã SP", "Tên sản phẩm", "Hãng",
+                        "Mô tả / Thông số", "ĐVT", "SL",
+                        "Đơn giá", "CK %", "Thành tiền", "Ghi chú"
+                    ]
+                    detail_show["Đơn giá"] = detail_show["Đơn giá"].apply(money_vnd)
+                    detail_show["Thành tiền"] = detail_show["Thành tiền"].apply(money_vnd)
+                    st.dataframe(detail_show, width="stretch", hide_index=True)
+
+                tt1, tt2, tt3 = st.columns(3)
+                with tt1:
+                    st.metric("Tạm tính", money_vnd(quote_header[7]))
+                with tt2:
+                    st.metric(f"VAT {float(quote_header[6] or 0):g}%", money_vnd(quote_header[8]))
+                with tt3:
+                    st.metric("Tổng cộng", money_vnd(quote_header[9]))
+
+                new_quote_status = st.selectbox(
+                    "Cập nhật trạng thái",
+                    ["Nháp", "Đã gửi", "Đã chốt", "Hủy"],
+                    index=["Nháp", "Đã gửi", "Đã chốt", "Hủy"].index(quote_header[4])
+                    if quote_header[4] in ["Nháp", "Đã gửi", "Đã chốt", "Hủy"] else 0,
+                    key=f"quote_status_update_{selected_quote_id}"
+                )
+
+                if st.button(
+                    "💾 Lưu trạng thái báo giá",
+                    key=f"save_quote_status_{selected_quote_id}"
+                ):
+                    cursor.execute("""
+                        UPDATE bao_gia
+                        SET trang_thai=?, ngay_cap_nhat=?
+                        WHERE id=?
+                    """, (
+                        new_quote_status,
+                        datetime.now().strftime("%d/%m/%Y %H:%M"),
+                        int(selected_quote_id)
+                    ))
+                    conn.commit()
+                    st.success("Đã cập nhật trạng thái báo giá.")
+                    st.rerun()
+
+                st.caption(
+                    "V3.3 lưu snapshot sản phẩm, SKU, giá và chiết khấu tại thời điểm tạo báo giá. "
+                    "V3.4 sẽ bổ sung Revision và xuất PDF chuyên nghiệp."
+                )
 
 
 # ============================================================
