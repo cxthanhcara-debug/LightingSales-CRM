@@ -57,7 +57,7 @@ COMPANY_ASSET_DIR = os.path.join(BASE_DIR, "company_assets")
 os.makedirs(COMPANY_ASSET_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "3.0.5"
+APP_VERSION = "3.1.0"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -270,6 +270,18 @@ CREATE TABLE IF NOT EXISTS cau_hinh_doanh_nghiep (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS cong_viec_lich_su (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cong_trinh_id INTEGER,
+    ten_du_an TEXT DEFAULT '',
+    noi_dung TEXT DEFAULT '',
+    ngay_hen TEXT DEFAULT '',
+    ghi_chu TEXT DEFAULT '',
+    ngay_hoan_thanh TEXT DEFAULT ''
+)
+""")
+
 conn.commit()
 
 # Nâng cấp database cũ: chỉ thêm cột, tuyệt đối không xóa dữ liệu hiện có.
@@ -278,6 +290,7 @@ ensure_column("khach_hang_goc", "dia_chi_cong_ty", "TEXT DEFAULT ''")
 ensure_column("cong_trinh_new", "dia_chi_cong_trinh", "TEXT DEFAULT ''")
 ensure_column("cong_trinh_new", "viec_tiep_theo", "TEXT DEFAULT ''")
 ensure_column("cong_trinh_new", "ngay_theo_doi", "TEXT DEFAULT ''")
+ensure_column("cong_trinh_new", "ghi_chu_cong_viec", "TEXT DEFAULT ''")
 ensure_column("san_pham", "mo_ta", "TEXT DEFAULT ''")
 ensure_column("san_pham", "hinh_anh", "TEXT DEFAULT ''")
 ensure_column("cau_hinh_doanh_nghiep", "logo_path", "TEXT DEFAULT ''")
@@ -313,6 +326,7 @@ def load_data():
             ngay_khoi_tao,
             viec_tiep_theo,
             ngay_theo_doi,
+            ghi_chu_cong_viec,
             note
         FROM cong_trinh_new
         ORDER BY id DESC
@@ -634,6 +648,7 @@ if page == "📊  Tổng quan":
                 "uu_tien": str(r.get("uu_tien", "") or ""),
                 "viec_tiep_theo": action,
                 "ngay_theo_doi": follow_date,
+                "ghi_chu_cong_viec": str(r.get("ghi_chu_cong_viec", "") or "").strip(),
             })
 
     overdue_items = sorted(
@@ -710,6 +725,110 @@ if page == "📊  Tổng quan":
             upcoming_items,
             "Không có follow-up trong 7 ngày tới."
         )
+
+    # --------------------------------------------------------
+    # Xử lý trực tiếp công việc đến hạn
+    # --------------------------------------------------------
+    all_action_items = overdue_items + today_items + upcoming_items
+    with st.expander("✏️ Xử lý công việc đến hạn", expanded=bool(overdue_items or today_items)):
+        if not all_action_items:
+            st.info("Hiện không có công việc quá hạn, hôm nay hoặc trong 7 ngày tới.")
+        else:
+            task_map = {
+                int(x["id"]): x for x in all_action_items if x.get("id") is not None
+            }
+            selected_task_id = st.selectbox(
+                "Chọn công việc cần xử lý",
+                list(task_map.keys()),
+                format_func=lambda x: f"#{x} - {task_map[x]['ten_du_an']} | {task_map[x]['viec_tiep_theo']} | {task_map[x]['ngay_theo_doi'].strftime('%d/%m/%Y')}",
+                key="dashboard_task_select"
+            )
+            task = task_map[selected_task_id]
+
+            c_task1, c_task2 = st.columns([1.5, 1])
+            with c_task1:
+                task_action_edit = st.text_area(
+                    "Việc cần làm",
+                    value=task["viec_tiep_theo"],
+                    key=f"dashboard_task_action_{selected_task_id}"
+                )
+                task_note_edit = st.text_area(
+                    "Ghi chú xử lý",
+                    value=task.get("ghi_chu_cong_viec", ""),
+                    placeholder="Ví dụ: Đã gọi khách, chờ xác nhận mẫu; cần gọi lại sau 2 ngày...",
+                    key=f"dashboard_task_note_{selected_task_id}"
+                )
+            with c_task2:
+                task_new_date = st.date_input(
+                    "Ngày theo dõi / thời hạn mới",
+                    value=task["ngay_theo_doi"],
+                    key=f"dashboard_task_date_{selected_task_id}"
+                )
+                st.caption(f"Giai đoạn: {task['giai_doan']} · Ưu tiên: {task['uu_tien']}")
+
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                if st.button("💾 Lưu ghi chú", use_container_width=True, key=f"save_task_note_{selected_task_id}"):
+                    cursor.execute("""
+                        UPDATE cong_trinh_new
+                        SET viec_tiep_theo=?, ghi_chu_cong_viec=?
+                        WHERE id=?
+                    """, (task_action_edit.strip(), task_note_edit.strip(), int(selected_task_id)))
+                    conn.commit()
+                    st.success("Đã lưu nội dung và ghi chú công việc.")
+                    st.rerun()
+            with b2:
+                if st.button("📅 Dời thời hạn", use_container_width=True, key=f"reschedule_task_{selected_task_id}"):
+                    new_date_text = task_new_date.strftime("%d/%m/%Y")
+                    cursor.execute("""
+                        UPDATE cong_trinh_new
+                        SET viec_tiep_theo=?, ngay_theo_doi=?, ghi_chu_cong_viec=?
+                        WHERE id=?
+                    """, (task_action_edit.strip(), new_date_text, task_note_edit.strip(), int(selected_task_id)))
+                    conn.commit()
+                    st.success(f"Đã dời thời hạn sang {new_date_text}.")
+                    st.rerun()
+            with b3:
+                if st.button("✅ Đã thực hiện", type="primary", use_container_width=True, key=f"complete_task_{selected_task_id}"):
+                    cursor.execute("""
+                        INSERT INTO cong_viec_lich_su
+                        (cong_trinh_id, ten_du_an, noi_dung, ngay_hen, ghi_chu, ngay_hoan_thanh)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (
+                        int(selected_task_id),
+                        task["ten_du_an"],
+                        task_action_edit.strip(),
+                        task["ngay_theo_doi"].strftime("%d/%m/%Y"),
+                        task_note_edit.strip(),
+                        datetime.now().strftime("%d/%m/%Y %H:%M")
+                    ))
+                    cursor.execute("""
+                        UPDATE cong_trinh_new
+                        SET viec_tiep_theo='', ngay_theo_doi='', ghi_chu_cong_viec=''
+                        WHERE id=?
+                    """, (int(selected_task_id),))
+                    conn.commit()
+                    st.success("Đã chuyển công việc sang mục Đã thực hiện.")
+                    st.rerun()
+
+    with st.expander("✅ Công việc đã thực hiện", expanded=False):
+        done_df = pd.read_sql_query("""
+            SELECT ten_du_an, noi_dung, ngay_hen, ghi_chu, ngay_hoan_thanh
+            FROM cong_viec_lich_su
+            ORDER BY id DESC
+            LIMIT 50
+        """, conn)
+        if done_df.empty:
+            st.caption("Chưa có công việc nào được đánh dấu hoàn thành.")
+        else:
+            done_df = done_df.rename(columns={
+                "ten_du_an": "Công trình",
+                "noi_dung": "Công việc",
+                "ngay_hen": "Ngày hẹn",
+                "ghi_chu": "Ghi chú",
+                "ngay_hoan_thanh": "Hoàn thành lúc"
+            })
+            st.dataframe(done_df, use_container_width=True, hide_index=True)
 
     st.markdown("---")
 
@@ -1027,12 +1146,17 @@ if page == "🏗️  Công trình":
                     placeholder="dd/mm/yyyy",
                     key=f"follow_date_{edit_id}"
                 )
+                task_note_project = st.text_area(
+                    "Ghi chú công việc",
+                    value="" if pd.isna(row.get("ghi_chu_cong_viec", "")) else str(row.get("ghi_chu_cong_viec", "")),
+                    key=f"project_task_note_{edit_id}"
+                )
                 if st.button("💾 Lưu cập nhật dự án", type="primary", key="save_project_progress"):
                     cursor.execute("""
                         UPDATE cong_trinh_new
-                        SET giai_doan=?, uu_tien=?, viec_tiep_theo=?, ngay_theo_doi=?
+                        SET giai_doan=?, uu_tien=?, viec_tiep_theo=?, ngay_theo_doi=?, ghi_chu_cong_viec=?
                         WHERE id=?
-                    """, (new_stage, new_priority, next_action.strip(), follow_date_text.strip(), int(edit_id)))
+                    """, (new_stage, new_priority, next_action.strip(), follow_date_text.strip(), task_note_project.strip(), int(edit_id)))
                     conn.commit()
                     st.success("Đã cập nhật tiến độ dự án.")
                     st.rerun()

@@ -1,6 +1,6 @@
 {
-  "version": "3.0.5",
+  "version": "3.1.0",
   "app_url": "https://raw.githubusercontent.com/cxthanhcara-debug/LightingSales-CRM/main/app.py",
-  "sha256": "71b6fbf9673203edd64810a46954268fdc4d228218812ca1d7c7da905d2c4911",
-  "notes": "v3.0.5 - Bổ sung danh mục sản phẩm: Đèn Steplight, Đèn gắn tường, Đèn Outdoor."
+  "sha256": "cfae4a7062a2333c8108a212fa2233e4360e3fe4da8fedca1c29f2bfd3b8203d",
+  "notes": "v3.1.0 - Task Management: xử lý công việc đến hạn ngay trên Tổng quan, thêm ghi chú, dời thời hạn, đánh dấu đã thực hiện và lưu lịch sử công việc."
 }
