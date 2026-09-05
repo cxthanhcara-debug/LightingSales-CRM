@@ -1,6 +1,6 @@
 {
-  "version": "3.1.0",
+  "version": "3.2.0",
   "app_url": "https://raw.githubusercontent.com/cxthanhcara-debug/LightingSales-CRM/main/app.py",
-  "sha256": "cfae4a7062a2333c8108a212fa2233e4360e3fe4da8fedca1c29f2bfd3b8203d",
-  "notes": "v3.1.0 - Task Management: xử lý công việc đến hạn ngay trên Tổng quan, thêm ghi chú, dời thời hạn, đánh dấu đã thực hiện và lưu lịch sử công việc."
+  "sha256": "ba7379fbff6b1da1f999b3f428b04dd72226cf8bd74546565be0608778225e8a",
+  "notes": "v3.2.0 - Project Workspace + Activity Manager: trang làm việc theo từng công trình, Activity nhiều công việc, deadline, ghi chú, hoàn thành/lịch sử, giá trị dự kiến và đồng bộ công việc gần nhất về Dashboard."
 }

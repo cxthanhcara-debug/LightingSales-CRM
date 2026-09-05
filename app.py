@@ -57,7 +57,7 @@ COMPANY_ASSET_DIR = os.path.join(BASE_DIR, "company_assets")
 os.makedirs(COMPANY_ASSET_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -282,6 +282,21 @@ CREATE TABLE IF NOT EXISTS cong_viec_lich_su (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS cong_trinh_hoat_dong (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cong_trinh_id INTEGER NOT NULL,
+    loai TEXT DEFAULT 'Follow-up',
+    noi_dung TEXT DEFAULT '',
+    ngay_hen TEXT DEFAULT '',
+    trang_thai TEXT DEFAULT 'Đang làm',
+    uu_tien TEXT DEFAULT 'Medium',
+    ghi_chu TEXT DEFAULT '',
+    ngay_tao TEXT DEFAULT '',
+    ngay_hoan_thanh TEXT DEFAULT ''
+)
+""")
+
 conn.commit()
 
 # Nâng cấp database cũ: chỉ thêm cột, tuyệt đối không xóa dữ liệu hiện có.
@@ -291,9 +306,40 @@ ensure_column("cong_trinh_new", "dia_chi_cong_trinh", "TEXT DEFAULT ''")
 ensure_column("cong_trinh_new", "viec_tiep_theo", "TEXT DEFAULT ''")
 ensure_column("cong_trinh_new", "ngay_theo_doi", "TEXT DEFAULT ''")
 ensure_column("cong_trinh_new", "ghi_chu_cong_viec", "TEXT DEFAULT ''")
+ensure_column("cong_trinh_new", "gia_tri_du_kien", "REAL DEFAULT 0")
 ensure_column("san_pham", "mo_ta", "TEXT DEFAULT ''")
 ensure_column("san_pham", "hinh_anh", "TEXT DEFAULT ''")
 ensure_column("cau_hinh_doanh_nghiep", "logo_path", "TEXT DEFAULT ''")
+
+
+# Chuyển công việc hiện có sang Activity Manager một lần, không tạo trùng.
+try:
+    legacy_projects = cursor.execute("""
+        SELECT id, viec_tiep_theo, ngay_theo_doi, ghi_chu_cong_viec, uu_tien
+        FROM cong_trinh_new
+        WHERE TRIM(COALESCE(viec_tiep_theo, '')) <> ''
+    """).fetchall()
+    for p in legacy_projects:
+        existing_count = cursor.execute(
+            "SELECT COUNT(*) FROM cong_trinh_hoat_dong WHERE cong_trinh_id=?",
+            (int(p[0]),)
+        ).fetchone()[0]
+        if existing_count == 0:
+            cursor.execute("""
+                INSERT INTO cong_trinh_hoat_dong
+                (cong_trinh_id, loai, noi_dung, ngay_hen, trang_thai, uu_tien, ghi_chu, ngay_tao)
+                VALUES (?, 'Follow-up', ?, ?, 'Đang làm', ?, ?, ?)
+            """, (
+                int(p[0]),
+                str(p[1] or "").strip(),
+                str(p[2] or "").strip(),
+                str(p[4] or "Medium"),
+                str(p[3] or "").strip(),
+                datetime.now().strftime("%d/%m/%Y %H:%M")
+            ))
+    conn.commit()
+except Exception:
+    pass
 
 
 # ============================================================
@@ -327,6 +373,7 @@ def load_data():
             viec_tiep_theo,
             ngay_theo_doi,
             ghi_chu_cong_viec,
+            gia_tri_du_kien,
             note
         FROM cong_trinh_new
         ORDER BY id DESC
@@ -363,6 +410,61 @@ def load_data():
     """, conn)
 
     return df_kh, df_ct, df_sp, df_cty
+
+
+def parse_activity_date(value):
+    """Đọc ngày dd/mm/yyyy cho Activity Manager."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    return None
+
+
+def sync_project_next_action(project_id):
+    """
+    Đồng bộ Activity đang mở gần nhất về 3 cột legacy để Dashboard cũ
+    tiếp tục hoạt động và luôn hiển thị việc gần nhất.
+    """
+    rows = cursor.execute("""
+        SELECT id, noi_dung, ngay_hen, ghi_chu
+        FROM cong_trinh_hoat_dong
+        WHERE cong_trinh_id=? AND trang_thai='Đang làm'
+        ORDER BY id ASC
+    """, (int(project_id),)).fetchall()
+
+    if not rows:
+        cursor.execute("""
+            UPDATE cong_trinh_new
+            SET viec_tiep_theo='', ngay_theo_doi='', ghi_chu_cong_viec=''
+            WHERE id=?
+        """, (int(project_id),))
+        conn.commit()
+        return
+
+    today = datetime.now().date()
+    def sort_key(r):
+        d = parse_activity_date(r[2])
+        return (0 if d else 1, d or today, int(r[0]))
+
+    selected = sorted(rows, key=sort_key)[0]
+    cursor.execute("""
+        UPDATE cong_trinh_new
+        SET viec_tiep_theo=?, ngay_theo_doi=?, ghi_chu_cong_viec=?
+        WHERE id=?
+    """, (
+        str(selected[1] or "").strip(),
+        str(selected[2] or "").strip(),
+        str(selected[3] or "").strip(),
+        int(project_id)
+    ))
+    conn.commit()
 
 
 # ============================================================
@@ -770,6 +872,15 @@ if page == "📊  Tổng quan":
             with b1:
                 if st.button("💾 Lưu ghi chú", use_container_width=True, key=f"save_task_note_{selected_task_id}"):
                     cursor.execute("""
+                        UPDATE cong_trinh_hoat_dong
+                        SET noi_dung=?, ghi_chu=?
+                        WHERE cong_trinh_id=? AND trang_thai='Đang làm'
+                          AND noi_dung=? AND ngay_hen=?
+                    """, (
+                        task_action_edit.strip(), task_note_edit.strip(), int(selected_task_id),
+                        task["viec_tiep_theo"], task["ngay_theo_doi"].strftime("%d/%m/%Y")
+                    ))
+                    cursor.execute("""
                         UPDATE cong_trinh_new
                         SET viec_tiep_theo=?, ghi_chu_cong_viec=?
                         WHERE id=?
@@ -780,6 +891,16 @@ if page == "📊  Tổng quan":
             with b2:
                 if st.button("📅 Dời thời hạn", use_container_width=True, key=f"reschedule_task_{selected_task_id}"):
                     new_date_text = task_new_date.strftime("%d/%m/%Y")
+                    cursor.execute("""
+                        UPDATE cong_trinh_hoat_dong
+                        SET noi_dung=?, ngay_hen=?, ghi_chu=?
+                        WHERE cong_trinh_id=? AND trang_thai='Đang làm'
+                          AND noi_dung=? AND ngay_hen=?
+                    """, (
+                        task_action_edit.strip(), new_date_text, task_note_edit.strip(),
+                        int(selected_task_id), task["viec_tiep_theo"],
+                        task["ngay_theo_doi"].strftime("%d/%m/%Y")
+                    ))
                     cursor.execute("""
                         UPDATE cong_trinh_new
                         SET viec_tiep_theo=?, ngay_theo_doi=?, ghi_chu_cong_viec=?
@@ -803,12 +924,20 @@ if page == "📊  Tổng quan":
                         datetime.now().strftime("%d/%m/%Y %H:%M")
                     ))
                     cursor.execute("""
-                        UPDATE cong_trinh_new
-                        SET viec_tiep_theo='', ngay_theo_doi='', ghi_chu_cong_viec=''
-                        WHERE id=?
-                    """, (int(selected_task_id),))
+                        UPDATE cong_trinh_hoat_dong
+                        SET noi_dung=?, ghi_chu=?, trang_thai='Đã hoàn thành',
+                            ngay_hoan_thanh=?
+                        WHERE cong_trinh_id=? AND trang_thai='Đang làm'
+                          AND noi_dung=? AND ngay_hen=?
+                    """, (
+                        task_action_edit.strip(), task_note_edit.strip(),
+                        datetime.now().strftime("%d/%m/%Y %H:%M"),
+                        int(selected_task_id), task["viec_tiep_theo"],
+                        task["ngay_theo_doi"].strftime("%d/%m/%Y")
+                    ))
                     conn.commit()
-                    st.success("Đã chuyển công việc sang mục Đã thực hiện.")
+                    sync_project_next_action(selected_task_id)
+                    st.success("Đã chuyển công việc sang mục Đã thực hiện. Nếu còn Activity khác, CRM sẽ tự đưa việc gần nhất lên Dashboard.")
                     st.rerun()
 
     with st.expander("✅ Công việc đã thực hiện", expanded=False):
@@ -988,13 +1117,17 @@ if page == "🏗️  Công trình":
         SELECT
             c.id,
             c.ten_du_an,
+            c.thoai_khach AS SDT_Khach,
             k.ten AS Chu_Dau_Tu,
+            k.ten_cong_ty AS Cong_Ty,
+            k.dia_chi_cong_ty AS Dia_Chi_Cong_Ty,
             c.dia_chi_cong_trinh AS Dia_Chi,
             c.uu_tien,
             c.giai_doan,
             c.viec_tiep_theo,
             c.ngay_theo_doi,
             c.ngay_khoi_tao,
+            c.gia_tri_du_kien,
             c.note
         FROM cong_trinh_new c
         LEFT JOIN khach_hang_goc k ON c.thoai_khach = k.thoai
@@ -1002,6 +1135,288 @@ if page == "🏗️  Công trình":
             CASE c.uu_tien WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END,
             c.id DESC
     """, conn)
+
+    # ========================================================
+    # PROJECT WORKSPACE - trung tâm làm việc của từng công trình
+    # ========================================================
+    st.markdown("### 🧭 Project Workspace")
+    st.caption("Chọn một công trình để xem thông tin, quản lý Activity và lịch sử làm việc tại một nơi.")
+
+    if not df_ct_joined.empty:
+        workspace_project_id = st.selectbox(
+            "Công trình đang làm việc",
+            df_ct_joined["id"].tolist(),
+            format_func=lambda x: f"#{x} - {df_ct_joined.loc[df_ct_joined['id']==x, 'ten_du_an'].iloc[0]}",
+            key="workspace_project_id"
+        )
+        wp = df_ct_joined[df_ct_joined["id"] == workspace_project_id].iloc[0]
+
+        wt1, wt2, wt3 = st.tabs(["📌 Tổng quan", "✅ Công việc / Activity", "🕘 Lịch sử"])
+
+        with wt1:
+            w1, w2, w3, w4 = st.columns(4)
+            with w1:
+                kpi_card("🎯", "GIAI ĐOẠN", str(wp["giai_doan"] or "—"), "Pipeline hiện tại")
+            with w2:
+                kpi_card("⚡", "ƯU TIÊN", str(wp["uu_tien"] or "—"), "Mức độ cần chú ý")
+            with w3:
+                expected_value = float(wp["gia_tri_du_kien"] or 0)
+                kpi_card("💰", "GIÁ TRỊ DỰ KIẾN", f"{expected_value:,.0f} đ", "Giá trị cơ hội")
+            with w4:
+                open_count = cursor.execute(
+                    "SELECT COUNT(*) FROM cong_trinh_hoat_dong WHERE cong_trinh_id=? AND trang_thai='Đang làm'",
+                    (int(workspace_project_id),)
+                ).fetchone()[0]
+                kpi_card("📋", "VIỆC ĐANG MỞ", int(open_count), "Activity chưa hoàn thành")
+
+            info1, info2 = st.columns(2)
+            with info1:
+                st.markdown("#### 👤 Khách hàng / Chủ đầu tư")
+                st.write(f"**Tên:** {wp['Chu_Dau_Tu'] if pd.notna(wp['Chu_Dau_Tu']) else '—'}")
+                st.write(f"**Công ty:** {wp['Cong_Ty'] if pd.notna(wp['Cong_Ty']) else '—'}")
+                st.write(f"**Điện thoại:** {wp['SDT_Khach'] if pd.notna(wp['SDT_Khach']) else '—'}")
+            with info2:
+                st.markdown("#### 🏗️ Thông tin công trình")
+                st.write(f"**Địa chỉ:** {wp['Dia_Chi'] if pd.notna(wp['Dia_Chi']) else '—'}")
+                st.write(f"**Khởi tạo:** {wp['ngay_khoi_tao'] if pd.notna(wp['ngay_khoi_tao']) else '—'}")
+                st.write(f"**Việc tiếp theo:** {wp['viec_tiep_theo'] if pd.notna(wp['viec_tiep_theo']) and str(wp['viec_tiep_theo']).strip() else 'Chưa có'}")
+
+            with st.expander("✏️ Cập nhật nhanh công trình"):
+                wc1, wc2, wc3 = st.columns(3)
+                workspace_stages = ["Tiếp cận", "Khảo sát", "Báo giá", "Thương lượng", "Chốt đơn", "Triển khai", "Hoàn thành", "Tạm dừng"]
+                workspace_priorities = ["High", "Medium", "Low"]
+                with wc1:
+                    wp_stage = st.selectbox(
+                        "Giai đoạn",
+                        workspace_stages,
+                        index=workspace_stages.index(wp["giai_doan"]) if wp["giai_doan"] in workspace_stages else 0,
+                        key=f"wp_stage_{workspace_project_id}"
+                    )
+                with wc2:
+                    wp_priority = st.selectbox(
+                        "Ưu tiên",
+                        workspace_priorities,
+                        index=workspace_priorities.index(wp["uu_tien"]) if wp["uu_tien"] in workspace_priorities else 1,
+                        key=f"wp_priority_{workspace_project_id}"
+                    )
+                with wc3:
+                    wp_value = st.number_input(
+                        "Giá trị dự kiến (VNĐ)",
+                        min_value=0.0,
+                        value=float(wp["gia_tri_du_kien"] or 0),
+                        step=1000000.0,
+                        format="%.0f",
+                        key=f"wp_value_{workspace_project_id}"
+                    )
+                wp_address = st.text_input(
+                    "Địa chỉ công trình",
+                    value="" if pd.isna(wp["Dia_Chi"]) else str(wp["Dia_Chi"]),
+                    key=f"wp_address_{workspace_project_id}"
+                )
+                wp_note = st.text_area(
+                    "Ghi chú công trình",
+                    value="" if pd.isna(wp["note"]) else str(wp["note"]),
+                    key=f"wp_note_{workspace_project_id}"
+                )
+                if st.button("💾 Lưu Project Workspace", type="primary", key=f"save_wp_{workspace_project_id}"):
+                    cursor.execute("""
+                        UPDATE cong_trinh_new
+                        SET giai_doan=?, uu_tien=?, gia_tri_du_kien=?, dia_chi_cong_trinh=?, note=?
+                        WHERE id=?
+                    """, (
+                        wp_stage, wp_priority, float(wp_value), wp_address.strip(),
+                        wp_note.strip(), int(workspace_project_id)
+                    ))
+                    conn.commit()
+                    st.success("Đã cập nhật thông tin công trình.")
+                    st.rerun()
+
+        with wt2:
+            activity_df = pd.read_sql_query("""
+                SELECT id, loai, noi_dung, ngay_hen, trang_thai, uu_tien,
+                       ghi_chu, ngay_tao, ngay_hoan_thanh
+                FROM cong_trinh_hoat_dong
+                WHERE cong_trinh_id=?
+                ORDER BY
+                    CASE trang_thai WHEN 'Đang làm' THEN 1 ELSE 2 END,
+                    id DESC
+            """, conn, params=(int(workspace_project_id),))
+
+            st.markdown("#### 📋 Công việc đang mở")
+            open_df = activity_df[activity_df["trang_thai"] == "Đang làm"].copy()
+            if open_df.empty:
+                st.info("Công trình này hiện chưa có Activity đang mở.")
+            else:
+                open_view = open_df[["id", "loai", "noi_dung", "ngay_hen", "uu_tien", "ghi_chu"]].copy()
+                open_view.columns = ["ID", "Loại", "Công việc", "Hạn", "Ưu tiên", "Ghi chú"]
+                st.dataframe(open_view, width="stretch", hide_index=True)
+
+            with st.expander("➕ Tạo Activity mới", expanded=open_df.empty):
+                ac1, ac2, ac3 = st.columns([1.2, 2, 1])
+                with ac1:
+                    new_activity_type = st.selectbox(
+                        "Loại công việc",
+                        ["Call", "Meeting", "Khảo sát", "Gửi báo giá", "Follow-up", "Gửi mẫu", "Deadline", "Khác"],
+                        key=f"new_activity_type_{workspace_project_id}"
+                    )
+                with ac2:
+                    new_activity_text = st.text_input(
+                        "Nội dung công việc *",
+                        placeholder="Ví dụ: Gọi khách xác nhận báo giá Rev.1",
+                        key=f"new_activity_text_{workspace_project_id}"
+                    )
+                with ac3:
+                    new_activity_priority = st.selectbox(
+                        "Ưu tiên",
+                        ["High", "Medium", "Low"],
+                        index=1,
+                        key=f"new_activity_priority_{workspace_project_id}"
+                    )
+                new_activity_date = st.date_input(
+                    "Ngày đến hạn",
+                    value=datetime.now().date(),
+                    key=f"new_activity_date_{workspace_project_id}"
+                )
+                new_activity_note = st.text_area(
+                    "Ghi chú",
+                    placeholder="Nội dung trao đổi, người cần liên hệ, thông tin cần chuẩn bị...",
+                    key=f"new_activity_note_{workspace_project_id}"
+                )
+                if st.button("➕ Thêm Activity", type="primary", key=f"add_activity_{workspace_project_id}"):
+                    if not new_activity_text.strip():
+                        st.warning("Vui lòng nhập nội dung công việc.")
+                    else:
+                        cursor.execute("""
+                            INSERT INTO cong_trinh_hoat_dong
+                            (cong_trinh_id, loai, noi_dung, ngay_hen, trang_thai,
+                             uu_tien, ghi_chu, ngay_tao)
+                            VALUES (?, ?, ?, ?, 'Đang làm', ?, ?, ?)
+                        """, (
+                            int(workspace_project_id),
+                            new_activity_type,
+                            new_activity_text.strip(),
+                            new_activity_date.strftime("%d/%m/%Y"),
+                            new_activity_priority,
+                            new_activity_note.strip(),
+                            datetime.now().strftime("%d/%m/%Y %H:%M")
+                        ))
+                        conn.commit()
+                        sync_project_next_action(workspace_project_id)
+                        st.success("Đã thêm Activity mới.")
+                        st.rerun()
+
+            if not open_df.empty:
+                with st.expander("✏️ Xử lý / cập nhật Activity", expanded=False):
+                    open_ids = open_df["id"].astype(int).tolist()
+                    act_id = st.selectbox(
+                        "Chọn Activity",
+                        open_ids,
+                        format_func=lambda x: f"#{x} - {open_df.loc[open_df['id']==x, 'noi_dung'].iloc[0]}",
+                        key=f"manage_activity_{workspace_project_id}"
+                    )
+                    act = open_df[open_df["id"] == act_id].iloc[0]
+                    ma1, ma2 = st.columns([1.6, 1])
+                    with ma1:
+                        act_text = st.text_area(
+                            "Nội dung",
+                            value=str(act["noi_dung"] or ""),
+                            key=f"manage_act_text_{act_id}"
+                        )
+                        act_note = st.text_area(
+                            "Ghi chú xử lý",
+                            value=str(act["ghi_chu"] or ""),
+                            key=f"manage_act_note_{act_id}"
+                        )
+                    with ma2:
+                        current_act_date = parse_activity_date(act["ngay_hen"]) or datetime.now().date()
+                        act_date = st.date_input(
+                            "Ngày đến hạn",
+                            value=current_act_date,
+                            key=f"manage_act_date_{act_id}"
+                        )
+                        act_priority = st.selectbox(
+                            "Ưu tiên",
+                            ["High", "Medium", "Low"],
+                            index=["High", "Medium", "Low"].index(act["uu_tien"]) if act["uu_tien"] in ["High", "Medium", "Low"] else 1,
+                            key=f"manage_act_priority_{act_id}"
+                        )
+
+                    ab1, ab2, ab3 = st.columns(3)
+                    with ab1:
+                        if st.button("💾 Lưu thay đổi", use_container_width=True, key=f"save_activity_{act_id}"):
+                            cursor.execute("""
+                                UPDATE cong_trinh_hoat_dong
+                                SET noi_dung=?, ngay_hen=?, uu_tien=?, ghi_chu=?
+                                WHERE id=?
+                            """, (
+                                act_text.strip(), act_date.strftime("%d/%m/%Y"),
+                                act_priority, act_note.strip(), int(act_id)
+                            ))
+                            conn.commit()
+                            sync_project_next_action(workspace_project_id)
+                            st.success("Đã lưu Activity.")
+                            st.rerun()
+                    with ab2:
+                        if st.button("📅 Dời +3 ngày", use_container_width=True, key=f"plus3_activity_{act_id}"):
+                            new_date = act_date + timedelta(days=3)
+                            cursor.execute("""
+                                UPDATE cong_trinh_hoat_dong
+                                SET ngay_hen=?, ghi_chu=?
+                                WHERE id=?
+                            """, (new_date.strftime("%d/%m/%Y"), act_note.strip(), int(act_id)))
+                            conn.commit()
+                            sync_project_next_action(workspace_project_id)
+                            st.success(f"Đã dời sang {new_date.strftime('%d/%m/%Y')}.")
+                            st.rerun()
+                    with ab3:
+                        if st.button("✅ Hoàn thành", type="primary", use_container_width=True, key=f"done_activity_{act_id}"):
+                            cursor.execute("""
+                                UPDATE cong_trinh_hoat_dong
+                                SET noi_dung=?, ghi_chu=?, trang_thai='Đã hoàn thành',
+                                    ngay_hoan_thanh=?
+                                WHERE id=?
+                            """, (
+                                act_text.strip(), act_note.strip(),
+                                datetime.now().strftime("%d/%m/%Y %H:%M"), int(act_id)
+                            ))
+                            cursor.execute("""
+                                INSERT INTO cong_viec_lich_su
+                                (cong_trinh_id, ten_du_an, noi_dung, ngay_hen, ghi_chu, ngay_hoan_thanh)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            """, (
+                                int(workspace_project_id),
+                                str(wp["ten_du_an"]),
+                                act_text.strip(),
+                                act_date.strftime("%d/%m/%Y"),
+                                act_note.strip(),
+                                datetime.now().strftime("%d/%m/%Y %H:%M")
+                            ))
+                            conn.commit()
+                            sync_project_next_action(workspace_project_id)
+                            st.success("Đã hoàn thành Activity và chuyển sang lịch sử.")
+                            st.rerun()
+
+        with wt3:
+            history_df = pd.read_sql_query("""
+                SELECT loai, noi_dung, ngay_hen, uu_tien, ghi_chu,
+                       ngay_tao, ngay_hoan_thanh
+                FROM cong_trinh_hoat_dong
+                WHERE cong_trinh_id=? AND trang_thai='Đã hoàn thành'
+                ORDER BY id DESC
+            """, conn, params=(int(workspace_project_id),))
+            if history_df.empty:
+                st.info("Chưa có Activity đã hoàn thành.")
+            else:
+                history_view = history_df.copy()
+                history_view.columns = [
+                    "Loại", "Công việc", "Ngày hẹn", "Ưu tiên",
+                    "Ghi chú", "Ngày tạo", "Hoàn thành"
+                ]
+                st.dataframe(history_view, width="stretch", hide_index=True)
+    else:
+        st.info("Chưa có công trình để mở Project Workspace.")
+
+    st.markdown("---")
 
     mode_col, search_col, priority_col = st.columns([1, 1.7, 1])
     with mode_col:
@@ -1134,6 +1549,14 @@ if page == "🏗️  Công trình":
                 priorities = ["High", "Medium", "Low"]
                 current_pr = row["uu_tien"] if row["uu_tien"] in priorities else "Medium"
                 new_priority = st.selectbox("Mức ưu tiên", priorities, index=priorities.index(current_pr), key="edit_project_priority")
+                project_expected_value = st.number_input(
+                    "Giá trị dự kiến (VNĐ)",
+                    min_value=0.0,
+                    value=float(row.get("gia_tri_du_kien", 0) or 0),
+                    step=1000000.0,
+                    format="%.0f",
+                    key=f"project_expected_value_{edit_id}"
+                )
                 next_action = st.text_area(
                     "Việc cần làm tiếp theo",
                     value="" if pd.isna(row["viec_tiep_theo"]) else str(row["viec_tiep_theo"]),
@@ -1154,10 +1577,27 @@ if page == "🏗️  Công trình":
                 if st.button("💾 Lưu cập nhật dự án", type="primary", key="save_project_progress"):
                     cursor.execute("""
                         UPDATE cong_trinh_new
-                        SET giai_doan=?, uu_tien=?, viec_tiep_theo=?, ngay_theo_doi=?, ghi_chu_cong_viec=?
+                        SET giai_doan=?, uu_tien=?, gia_tri_du_kien=?, viec_tiep_theo=?, ngay_theo_doi=?, ghi_chu_cong_viec=?
                         WHERE id=?
-                    """, (new_stage, new_priority, next_action.strip(), follow_date_text.strip(), task_note_project.strip(), int(edit_id)))
+                    """, (new_stage, new_priority, float(project_expected_value), next_action.strip(), follow_date_text.strip(), task_note_project.strip(), int(edit_id)))
                     conn.commit()
+                    if next_action.strip():
+                        existing_open = cursor.execute(
+                            "SELECT COUNT(*) FROM cong_trinh_hoat_dong WHERE cong_trinh_id=? AND trang_thai='Đang làm'",
+                            (int(edit_id),)
+                        ).fetchone()[0]
+                        if existing_open == 0:
+                            cursor.execute("""
+                                INSERT INTO cong_trinh_hoat_dong
+                                (cong_trinh_id, loai, noi_dung, ngay_hen, trang_thai, uu_tien, ghi_chu, ngay_tao)
+                                VALUES (?, 'Follow-up', ?, ?, 'Đang làm', ?, ?, ?)
+                            """, (
+                                int(edit_id), next_action.strip(), follow_date_text.strip(),
+                                new_priority, task_note_project.strip(),
+                                datetime.now().strftime("%d/%m/%Y %H:%M")
+                            ))
+                            conn.commit()
+                    sync_project_next_action(edit_id)
                     st.success("Đã cập nhật tiến độ dự án.")
                     st.rerun()
 
@@ -1173,6 +1613,14 @@ if page == "🏗️  Công trình":
                 st.warning("Chưa có khách hàng. Hãy tạo khách hàng trước.")
                 thoai_khach_save = ""
             uu_tien = st.selectbox("Mức ưu tiên", ["High", "Medium", "Low"], index=1, key="new_project_priority")
+            gia_tri_du_kien_new = st.number_input(
+                "Giá trị dự kiến (VNĐ)",
+                min_value=0.0,
+                value=0.0,
+                step=1000000.0,
+                format="%.0f",
+                key="new_project_expected_value"
+            )
             giai_doan = st.selectbox("Giai đoạn dự án", ["Tiếp cận","Khảo sát","Báo giá","Thương lượng","Chốt đơn","Triển khai","Hoàn thành","Tạm dừng"], key="new_project_stage")
             ngay_khoi_tao = st.date_input("Ngày khởi tạo", value=datetime.now().date(), key="new_project_date")
             next_action_new = st.text_area("Việc cần làm tiếp theo", key="new_project_next_action")
@@ -1187,14 +1635,26 @@ if page == "🏗️  Công trình":
                     cursor.execute("""
                         INSERT INTO cong_trinh_new
                         (ten_du_an, thoai_khach, dia_chi_cong_trinh, uu_tien, giai_doan,
-                         ngay_khoi_tao, viec_tiep_theo, ngay_theo_doi, note)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         ngay_khoi_tao, gia_tri_du_kien, viec_tiep_theo, ngay_theo_doi, note)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         ten_du_an.strip(), thoai_khach_save, dia_chi_cong_trinh.strip(),
                         uu_tien, giai_doan, ngay_khoi_tao.strftime("%d/%m/%Y"),
-                        next_action_new.strip(), follow_new.strip(), note.strip()
+                        float(gia_tri_du_kien_new), next_action_new.strip(), follow_new.strip(), note.strip()
                     ))
                     conn.commit()
+                    new_project_id = cursor.lastrowid
+                    if next_action_new.strip():
+                        cursor.execute("""
+                            INSERT INTO cong_trinh_hoat_dong
+                            (cong_trinh_id, loai, noi_dung, ngay_hen, trang_thai, uu_tien, ghi_chu, ngay_tao)
+                            VALUES (?, 'Follow-up', ?, ?, 'Đang làm', ?, '', ?)
+                        """, (
+                            int(new_project_id), next_action_new.strip(), follow_new.strip(),
+                            uu_tien, datetime.now().strftime("%d/%m/%Y %H:%M")
+                        ))
+                        conn.commit()
+                        sync_project_next_action(new_project_id)
                     st.success("Đã tạo công trình!")
                     st.rerun()
 
