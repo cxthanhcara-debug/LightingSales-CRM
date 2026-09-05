@@ -1,6 +1,6 @@
 {
-  "version": "3.2.1",
+  "version": "3.2.2",
   "app_url": "https://raw.githubusercontent.com/cxthanhcara-debug/LightingSales-CRM/main/app.py",
-  "sha256": "3ca2021e9734f47034fc86970f8373e8048472447a60f4551dec0458aab484c3",
-  "notes": "v3.2.1 - Project Workspace hiển thị thành menu riêng trên sidebar; Activity Manager, deadline, lịch sử và giá trị dự kiến dễ truy cập rõ ràng."
+  "sha256": "062b37ef39edb6c1573f42daadaa2fb780bc8c67a5ff586c08a734a2c24c50ac",
+  "notes": "v3.2.2 - Fix Dashboard Activity: công việc đã hoàn thành tự ẩn; Tổng quan chỉ đọc Activity trạng thái Đang làm; xử lý theo Activity ID để tránh treo công việc cũ."
 }
