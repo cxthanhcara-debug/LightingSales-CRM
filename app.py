@@ -57,7 +57,7 @@ COMPANY_ASSET_DIR = os.path.join(BASE_DIR, "company_assets")
 os.makedirs(COMPANY_ASSET_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.2.1"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -654,7 +654,7 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section">MENU CHÍNH</div>', unsafe_allow_html=True)
     page = st.radio(
         "Điều hướng",
-        ["📊  Tổng quan", "👥  Khách hàng", "🏗️  Công trình", "🧾  Báo giá", "📦  Sản phẩm", "🏢  Thông tin công ty"],
+        ["📊  Tổng quan", "🧭  Project Workspace", "👥  Khách hàng", "🏗️  Công trình", "🧾  Báo giá", "📦  Sản phẩm", "🏢  Thông tin công ty"],
         label_visibility="collapsed",
         key="main_navigation"
     )
@@ -1024,7 +1024,7 @@ if page == "📊  Tổng quan":
 
     st.markdown("")
     st.info(
-        "💡 Mẹo: ở menu Công trình, hãy luôn điền 'Việc cần làm tiếp theo' "
+        "💡 Mẹo: mở menu Project Workspace để tạo và xử lý nhiều Activity cho từng công trình. "
         "và 'Ngày cần theo dõi'. Dashboard sẽ tự đưa công việc vào Quá hạn / Hôm nay / 7 ngày tới."
     )
 
@@ -1095,46 +1095,12 @@ if page == "👥  Khách hàng":
 # TAB 3 - CÔNG TRÌNH
 # ============================================================
 
-if page == "🏗️  Công trình":
-    page_header("Công trình", "Trung tâm theo dõi dự án: đang ở giai đoạn nào và việc cần làm tiếp theo.")
 
-    # --- Project control KPIs ---
-    total_ct = len(df_ct)
-    active_ct = int((~df_ct["giai_doan"].fillna("").eq("Hoàn thành")).sum()) if total_ct else 0
-    high_ct = int(df_ct["uu_tien"].fillna("").str.lower().eq("high").sum()) if total_ct else 0
-    follow_ct = int(df_ct["viec_tiep_theo"].fillna("").str.strip().ne("").sum()) if total_ct else 0
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1: kpi_card("🏗️", "TỔNG DỰ ÁN", total_ct, "Toàn bộ công trình")
-    with c2: kpi_card("▶️", "ĐANG THEO DÕI", active_ct, "Chưa hoàn thành")
-    with c3: kpi_card("⚡", "ƯU TIÊN CAO", high_ct, "Cần chú ý")
-    with c4: kpi_card("📌", "CÓ VIỆC TIẾP THEO", follow_ct, "Đã có action")
-
-    st.markdown("### 🎯 Bảng điều hành dự án")
-    st.caption("Nhìn nhanh dự án đang ở đâu trong pipeline, việc tiếp theo là gì và khi nào cần follow-up.")
-
-    df_ct_joined = pd.read_sql_query("""
-        SELECT
-            c.id,
-            c.ten_du_an,
-            c.thoai_khach AS SDT_Khach,
-            k.ten AS Chu_Dau_Tu,
-            k.ten_cong_ty AS Cong_Ty,
-            k.dia_chi_cong_ty AS Dia_Chi_Cong_Ty,
-            c.dia_chi_cong_trinh AS Dia_Chi,
-            c.uu_tien,
-            c.giai_doan,
-            c.viec_tiep_theo,
-            c.ngay_theo_doi,
-            c.ngay_khoi_tao,
-            c.gia_tri_du_kien,
-            c.note
-        FROM cong_trinh_new c
-        LEFT JOIN khach_hang_goc k ON c.thoai_khach = k.thoai
-        ORDER BY
-            CASE c.uu_tien WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END,
-            c.id DESC
-    """, conn)
+# ============================================================
+# PROJECT WORKSPACE - TRANG RIÊNG
+# ============================================================
+if page == "🧭  Project Workspace":
+    page_header("Project Workspace", "Trung tâm điều hành từng công trình: thông tin, Activity, deadline và lịch sử làm việc.")
 
     # ========================================================
     # PROJECT WORKSPACE - trung tâm làm việc của từng công trình
@@ -1417,6 +1383,50 @@ if page == "🏗️  Công trình":
         st.info("Chưa có công trình để mở Project Workspace.")
 
     st.markdown("---")
+
+
+if page == "🏗️  Công trình":
+    page_header("Công trình", "Trung tâm theo dõi dự án: đang ở giai đoạn nào và việc cần làm tiếp theo.")
+
+    # --- Project control KPIs ---
+    total_ct = len(df_ct)
+    active_ct = int((~df_ct["giai_doan"].fillna("").eq("Hoàn thành")).sum()) if total_ct else 0
+    high_ct = int(df_ct["uu_tien"].fillna("").str.lower().eq("high").sum()) if total_ct else 0
+    follow_ct = int(df_ct["viec_tiep_theo"].fillna("").str.strip().ne("").sum()) if total_ct else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: kpi_card("🏗️", "TỔNG DỰ ÁN", total_ct, "Toàn bộ công trình")
+    with c2: kpi_card("▶️", "ĐANG THEO DÕI", active_ct, "Chưa hoàn thành")
+    with c3: kpi_card("⚡", "ƯU TIÊN CAO", high_ct, "Cần chú ý")
+    with c4: kpi_card("📌", "CÓ VIỆC TIẾP THEO", follow_ct, "Đã có action")
+
+    st.markdown("### 🎯 Bảng điều hành dự án")
+    st.caption("Nhìn nhanh dự án đang ở đâu trong pipeline, việc tiếp theo là gì và khi nào cần follow-up.")
+
+    df_ct_joined = pd.read_sql_query("""
+        SELECT
+            c.id,
+            c.ten_du_an,
+            c.thoai_khach AS SDT_Khach,
+            k.ten AS Chu_Dau_Tu,
+            k.ten_cong_ty AS Cong_Ty,
+            k.dia_chi_cong_ty AS Dia_Chi_Cong_Ty,
+            c.dia_chi_cong_trinh AS Dia_Chi,
+            c.uu_tien,
+            c.giai_doan,
+            c.viec_tiep_theo,
+            c.ngay_theo_doi,
+            c.ngay_khoi_tao,
+            c.gia_tri_du_kien,
+            c.note
+        FROM cong_trinh_new c
+        LEFT JOIN khach_hang_goc k ON c.thoai_khach = k.thoai
+        ORDER BY
+            CASE c.uu_tien WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END,
+            c.id DESC
+    """, conn)
+
+    st.info("🧭 Project Workspace đã được tách thành menu riêng trên sidebar để làm việc theo từng công trình nhanh hơn.")
 
     mode_col, search_col, priority_col = st.columns([1, 1.7, 1])
     with mode_col:
