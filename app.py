@@ -57,7 +57,7 @@ COMPANY_ASSET_DIR = os.path.join(BASE_DIR, "company_assets")
 os.makedirs(COMPANY_ASSET_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.3.1"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -538,6 +538,19 @@ def get_project_customer(project_id):
     return row
 
 
+def deal_health_label(stage, next_action, follow_date_text):
+    if str(stage or "").strip() == "Hoàn thành":
+        return "✓ Closed"
+    action = str(next_action or "").strip()
+    due = parse_activity_date(follow_date_text)
+    today = datetime.now().date()
+    if due and due < today:
+        return "🔴 At Risk"
+    if not action or due is None:
+        return "🟡 Attention"
+    return "🟢 Healthy"
+
+
 # ============================================================
 # 5. GIAO DIỆN - MODERN BUSINESS CRM
 # ============================================================
@@ -725,7 +738,7 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section">MENU CHÍNH</div>', unsafe_allow_html=True)
     page = st.radio(
         "Điều hướng",
-        ["📊  Tổng quan", "🧭  Project Workspace", "👥  Khách hàng", "🏗️  Công trình", "🧾  Báo giá", "📦  Sản phẩm", "🏢  Thông tin công ty"],
+        ["⌂  Home", "◎  Deals", "✓  Activities", "🧾  Quotations", "♙  Customers", "▦  Products", "⚙  Settings"],
         label_visibility="collapsed",
         key="main_navigation"
     )
@@ -760,6 +773,20 @@ with st.sidebar:
 # 6. LOAD DATA
 # ============================================================
 df_kh, df_ct, df_sp, df_cty_saved = load_data()
+
+# ============================================================
+# V3.3.1 - PROFESSIONAL CRM ROUTING
+# ============================================================
+crm_page = page
+page_alias = {
+    "⌂  Home": "📊  Tổng quan",
+    "◎  Deals": "🏗️  Công trình",
+    "🧾  Quotations": "🧾  Báo giá",
+    "♙  Customers": "👥  Khách hàng",
+    "▦  Products": "📦  Sản phẩm",
+    "⚙  Settings": "🏢  Thông tin công ty",
+}
+page = page_alias.get(page, page)
 
 # ============================================================
 # TAB 1 - DASHBOARD
@@ -1171,10 +1198,113 @@ if page == "👥  Khách hàng":
 # ============================================================
 
 
+
+# ============================================================
+# V3.3.1 - ACTIVITIES CENTER
+# ============================================================
+if crm_page == "✓  Activities":
+    page_header("Activities", "My Work — quản lý tập trung các cuộc gọi, meeting, khảo sát, follow-up và deadline.")
+
+    act_df = pd.read_sql_query("""
+        SELECT a.id, a.cong_trinh_id, a.loai, a.noi_dung, a.ngay_hen,
+               a.uu_tien, a.ghi_chu, c.ten_du_an, c.giai_doan, c.gia_tri_du_kien
+        FROM cong_trinh_hoat_dong a
+        JOIN cong_trinh_new c ON c.id=a.cong_trinh_id
+        WHERE a.trang_thai='Đang làm'
+          AND COALESCE(c.giai_doan,'') <> 'Hoàn thành'
+        ORDER BY a.id DESC
+    """, conn)
+
+    today_act = datetime.now().date()
+    act_rows = []
+    for _, ar in act_df.iterrows():
+        due = parse_activity_date(ar["ngay_hen"])
+        delta = (due - today_act).days if due else 9999
+        if due and delta < 0: bucket = "Quá hạn"
+        elif due and delta == 0: bucket = "Hôm nay"
+        elif due and delta <= 7: bucket = "7 ngày tới"
+        else: bucket = "Sắp tới"
+        item = ar.to_dict()
+        item.update({"_due": due, "_delta": delta, "_bucket": bucket})
+        act_rows.append(item)
+
+    a1, a2, a3, a4 = st.columns(4)
+    with a1: kpi_card("🔴", "QUÁ HẠN", sum(x["_bucket"]=="Quá hạn" for x in act_rows), "Cần xử lý ngay")
+    with a2: kpi_card("●", "HÔM NAY", sum(x["_bucket"]=="Hôm nay" for x in act_rows), "Đến hạn hôm nay")
+    with a3: kpi_card("◷", "7 NGÀY TỚI", sum(x["_bucket"]=="7 ngày tới" for x in act_rows), "Lịch follow-up")
+    with a4: kpi_card("✓", "ĐANG MỞ", len(act_rows), "Tổng Activity")
+
+    activity_filter = st.selectbox(
+        "Bộ lọc",
+        ["Tất cả", "Quá hạn", "Hôm nay", "7 ngày tới", "Sắp tới"],
+        key="activity_center_filter_v331"
+    )
+    filtered = act_rows if activity_filter == "Tất cả" else [x for x in act_rows if x["_bucket"] == activity_filter]
+    filtered = sorted(filtered, key=lambda x: (x["_delta"], int(x["id"])))
+
+    if not filtered:
+        st.success("Không có Activity trong nhóm này.")
+    else:
+        act_view = pd.DataFrame([{
+            "ID": int(x["id"]), "Hạn": x["ngay_hen"], "Loại": x["loai"],
+            "Công việc": x["noi_dung"], "Deal / Công trình": x["ten_du_an"],
+            "Giai đoạn": x["giai_doan"], "Ưu tiên": x["uu_tien"],
+            "Giá trị": money_vnd(x["gia_tri_du_kien"] or 0)
+        } for x in filtered])
+        st.dataframe(act_view, width="stretch", hide_index=True)
+
+        with st.expander("✓ Xử lý Activity", expanded=False):
+            ids = [int(x["id"]) for x in filtered]
+            aid = st.selectbox(
+                "Chọn Activity", ids,
+                format_func=lambda x: next(f"#{x} · {a['ten_du_an']} · {a['noi_dung']}" for a in filtered if int(a["id"])==x),
+                key="activity_center_select_v331"
+            )
+            item = next(a for a in filtered if int(a["id"]) == aid)
+            c1, c2 = st.columns([1.5,1])
+            with c1:
+                atext = st.text_area("Nội dung", value=str(item["noi_dung"] or ""), key=f"acenter_text_{aid}")
+                anote = st.text_area("Ghi chú", value=str(item["ghi_chu"] or ""), key=f"acenter_note_{aid}")
+            with c2:
+                adate = st.date_input("Deadline", value=item["_due"] or today_act, key=f"acenter_date_{aid}")
+                apriority = st.selectbox(
+                    "Ưu tiên", ["High","Medium","Low"],
+                    index=["High","Medium","Low"].index(item["uu_tien"]) if item["uu_tien"] in ["High","Medium","Low"] else 1,
+                    key=f"acenter_priority_{aid}"
+                )
+            b1,b2 = st.columns(2)
+            with b1:
+                if st.button("💾 Lưu Activity", use_container_width=True, key=f"acenter_save_{aid}"):
+                    cursor.execute("""
+                        UPDATE cong_trinh_hoat_dong SET noi_dung=?, ngay_hen=?, uu_tien=?, ghi_chu=?
+                        WHERE id=? AND trang_thai='Đang làm'
+                    """,(atext.strip(),adate.strftime("%d/%m/%Y"),apriority,anote.strip(),aid))
+                    conn.commit()
+                    sync_project_next_action(int(item["cong_trinh_id"]))
+                    st.rerun()
+            with b2:
+                if st.button("✓ Hoàn thành", type="primary", use_container_width=True, key=f"acenter_done_{aid}"):
+                    completed_at = datetime.now().strftime("%d/%m/%Y %H:%M")
+                    cursor.execute("""
+                        UPDATE cong_trinh_hoat_dong
+                        SET noi_dung=?, ghi_chu=?, trang_thai='Đã hoàn thành', ngay_hoan_thanh=?
+                        WHERE id=? AND trang_thai='Đang làm'
+                    """,(atext.strip(),anote.strip(),completed_at,aid))
+                    if cursor.rowcount > 0:
+                        cursor.execute("""
+                            INSERT INTO cong_viec_lich_su
+                            (cong_trinh_id,ten_du_an,noi_dung,ngay_hen,ghi_chu,ngay_hoan_thanh)
+                            VALUES (?,?,?,?,?,?)
+                        """,(int(item["cong_trinh_id"]),item["ten_du_an"],atext.strip(),
+                             adate.strftime("%d/%m/%Y"),anote.strip(),completed_at))
+                    conn.commit()
+                    sync_project_next_action(int(item["cong_trinh_id"]))
+                    st.rerun()
+
 # ============================================================
 # PROJECT WORKSPACE - TRANG RIÊNG
 # ============================================================
-if page == "🧭  Project Workspace":
+if page == "🧭  Project Workspace" or (page == "🏗️  Công trình" and locals().get("deal_view_mode") == "Deal Workspace"):
     page_header("Project Workspace", "Trung tâm điều hành từng công trình: thông tin, Activity, deadline và lịch sử làm việc.")
 
     # ========================================================
@@ -1461,6 +1591,12 @@ if page == "🧭  Project Workspace":
 
 
 if page == "🏗️  Công trình":
+    deal_view_mode = st.radio(
+        "Chế độ Deals",
+        ["Pipeline & Danh sách", "Deal Workspace"],
+        horizontal=True,
+        key="deal_view_mode_v331"
+    )
     page_header("Công trình", "Trung tâm theo dõi dự án: đang ở giai đoạn nào và việc cần làm tiếp theo.")
 
     # --- Project control KPIs ---
@@ -1603,12 +1739,16 @@ if page == "🏗️  Công trình":
 
         display_cols = [
             "id", "ten_du_an", "Chu_Dau_Tu", "uu_tien",
-            "giai_doan", "viec_tiep_theo", "ngay_theo_doi"
+            "giai_doan", "gia_tri_du_kien", "viec_tiep_theo", "ngay_theo_doi"
         ]
         display = view[display_cols].copy()
+        display["Deal Health"] = view.apply(
+            lambda r: deal_health_label(r["giai_doan"], r["viec_tiep_theo"], r["ngay_theo_doi"]), axis=1
+        )
+        display["gia_tri_du_kien"] = display["gia_tri_du_kien"].apply(money_vnd)
         display.columns = [
-            "ID", "Công trình", "Khách hàng / CĐT", "Ưu tiên",
-            "Giai đoạn", "Việc tiếp theo", "Ngày theo dõi"
+            "ID", "Deal / Công trình", "Khách hàng / CĐT", "Ưu tiên",
+            "Giai đoạn", "Giá trị", "Việc tiếp theo", "Ngày theo dõi", "Deal Health"
         ]
         st.dataframe(display, width="stretch", hide_index=True)
 
@@ -1763,7 +1903,7 @@ if page == "🏗️  Công trình":
 
 if page == "🧾  Báo giá":
     page_header(
-        "Báo giá",
+        "Quotations",
         "Tạo báo giá nhanh từ kho sản phẩm, nhập SKU, số lượng, chiết khấu và lưu theo công trình."
     )
 
