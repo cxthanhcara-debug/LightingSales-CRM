@@ -14,6 +14,9 @@ import html
 import urllib.request
 import urllib.error
 import io
+import zipfile
+import uuid
+import tempfile
 from datetime import datetime, timedelta
 
 # ============================================================
@@ -57,10 +60,12 @@ COMPANY_ASSET_DIR = os.path.join(BASE_DIR, "company_assets")
 os.makedirs(COMPANY_ASSET_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "3.3.1"
+APP_VERSION = "3.4.0"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
+DATA_BACKUP_DIR = os.path.join(BACKUP_DIR, "data")
+os.makedirs(DATA_BACKUP_DIR, exist_ok=True)
 
 
 def load_update_config():
@@ -336,6 +341,65 @@ CREATE TABLE IF NOT EXISTS bao_gia_chi_tiet (
 )
 """)
 
+# Nền tảng AI Agent: migration, hàng chờ phê duyệt và nhật ký bất biến.
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    description TEXT DEFAULT '',
+    applied_at TEXT DEFAULT ''
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS agent_action_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action_uuid TEXT UNIQUE NOT NULL,
+    action_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    summary TEXT DEFAULT '',
+    status TEXT DEFAULT 'Chờ duyệt',
+    requested_by TEXT DEFAULT 'AI Agent',
+    created_at TEXT DEFAULT '',
+    reviewed_at TEXT DEFAULT '',
+    review_note TEXT DEFAULT '',
+    error_message TEXT DEFAULT ''
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS agent_action_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action_uuid TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    action_type TEXT DEFAULT '',
+    summary TEXT DEFAULT '',
+    payload_json TEXT DEFAULT '',
+    result_json TEXT DEFAULT '',
+    created_at TEXT DEFAULT ''
+)
+""")
+
+cursor.execute("""
+CREATE INDEX IF NOT EXISTS idx_agent_queue_status
+ON agent_action_queue(status, id)
+""")
+
+cursor.execute("""
+CREATE INDEX IF NOT EXISTS idx_agent_log_uuid
+ON agent_action_log(action_uuid, id)
+""")
+
+cursor.execute("""
+INSERT OR IGNORE INTO schema_migrations (version, description, applied_at)
+VALUES (3400, 'B1 backup/restore + B2 safe Agent tool layer', ?)
+""", (datetime.now().strftime("%d/%m/%Y %H:%M:%S"),))
+
+conn.commit()
+
+cursor.execute("""
+INSERT OR IGNORE INTO schema_migrations(version, description, applied_at)
+VALUES (340, 'B1 bảo vệ dữ liệu và B2 nền tảng công cụ AI Agent', ?)
+""", (datetime.now().strftime("%d/%m/%Y %H:%M:%S"),))
 conn.commit()
 
 # Nâng cấp database cũ: chỉ thêm cột, tuyệt đối không xóa dữ liệu hiện có.
@@ -466,7 +530,7 @@ def parse_activity_date(value):
     return None
 
 
-def sync_project_next_action(project_id):
+def sync_project_next_action(project_id, commit=True):
     """
     Đồng bộ Activity đang mở gần nhất về 3 cột legacy để Dashboard cũ
     tiếp tục hoạt động và luôn hiển thị việc gần nhất.
@@ -484,7 +548,8 @@ def sync_project_next_action(project_id):
             SET viec_tiep_theo='', ngay_theo_doi='', ghi_chu_cong_viec=''
             WHERE id=?
         """, (int(project_id),))
-        conn.commit()
+        if commit:
+            conn.commit()
         return
 
     today = datetime.now().date()
@@ -503,7 +568,8 @@ def sync_project_next_action(project_id):
         str(selected[3] or "").strip(),
         int(project_id)
     ))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 
@@ -549,6 +615,566 @@ def deal_health_label(stage, next_action, follow_date_text):
     if not action or due is None:
         return "🟡 Attention"
     return "🟢 Healthy"
+
+
+# ============================================================
+# B1 - BẢO VỆ, SAO LƯU VÀ KHÔI PHỤC DỮ LIỆU
+# ============================================================
+
+def database_health():
+    """Kiểm tra database và trả về thông tin đủ gọn để hiển thị trên CRM."""
+    integrity_row = cursor.execute("PRAGMA integrity_check").fetchone()
+    integrity = str(integrity_row[0] if integrity_row else "unknown")
+    table_counts = {}
+    for table_name in (
+        "khach_hang_goc", "cong_trinh_new", "cong_trinh_hoat_dong",
+        "cong_viec_lich_su", "san_pham", "bao_gia", "bao_gia_chi_tiet",
+        "agent_action_queue", "agent_action_log"
+    ):
+        table_counts[table_name] = int(
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0] or 0
+        )
+    return {
+        "ok": integrity.lower() == "ok",
+        "integrity": integrity,
+        "database_size": os.path.getsize(DB_FILE) if os.path.exists(DB_FILE) else 0,
+        "table_counts": table_counts,
+    }
+
+
+def _zip_directory(zip_file, source_dir, archive_root):
+    if not os.path.isdir(source_dir):
+        return
+    for root, _, files in os.walk(source_dir):
+        for filename in files:
+            abs_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(abs_path, source_dir)
+            zip_file.write(abs_path, os.path.join(archive_root, rel_path))
+
+
+def create_full_backup(trigger="manual", note=""):
+    """Tạo ZIP chứa snapshot SQLite, ảnh, logo, app và manifest kiểm tra."""
+    safe_trigger = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(trigger))[:30] or "manual"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_name = f"lightingsales_{timestamp}_{safe_trigger}.zip"
+    backup_path = os.path.join(DATA_BACKUP_DIR, backup_name)
+
+    health = database_health()
+    if not health["ok"]:
+        raise RuntimeError(f"Database không đạt kiểm tra integrity: {health['integrity']}")
+
+    with tempfile.TemporaryDirectory(prefix="lightingsales_backup_") as temp_dir:
+        snapshot_path = os.path.join(temp_dir, "lightingsales.db")
+        snapshot_conn = sqlite3.connect(snapshot_path)
+        try:
+            conn.backup(snapshot_conn)
+        finally:
+            snapshot_conn.close()
+
+        snapshot_check = sqlite3.connect(snapshot_path)
+        try:
+            check = snapshot_check.execute("PRAGMA integrity_check").fetchone()[0]
+        finally:
+            snapshot_check.close()
+        if str(check).lower() != "ok":
+            raise RuntimeError("Snapshot database không đạt kiểm tra integrity.")
+
+        with open(snapshot_path, "rb") as snapshot_file:
+            database_hash = hashlib.sha256(snapshot_file.read()).hexdigest()
+
+        manifest = {
+            "format": "LightingSales CRM Backup",
+            "format_version": 1,
+            "app_version": APP_VERSION,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "trigger": safe_trigger,
+            "note": str(note or "").strip(),
+            "database_sha256": database_hash,
+            "table_counts": health["table_counts"],
+        }
+
+        with zipfile.ZipFile(backup_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(snapshot_path, "database/lightingsales.db")
+            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+            current_app = os.path.abspath(__file__)
+            if os.path.isfile(current_app):
+                zf.write(current_app, "application/app.py")
+            if os.path.isfile(UPDATE_CONFIG_FILE):
+                zf.write(UPDATE_CONFIG_FILE, "application/update_config.json")
+            _zip_directory(zf, PRODUCT_IMAGE_DIR, "product_images")
+            _zip_directory(zf, COMPANY_ASSET_DIR, "company_assets")
+    return backup_path
+
+
+def list_data_backups():
+    backups = []
+    if not os.path.isdir(DATA_BACKUP_DIR):
+        return backups
+    for filename in os.listdir(DATA_BACKUP_DIR):
+        path = os.path.join(DATA_BACKUP_DIR, filename)
+        if filename.lower().endswith(".zip") and os.path.isfile(path):
+            backups.append({
+                "name": filename,
+                "path": path,
+                "size": os.path.getsize(path),
+                "modified": datetime.fromtimestamp(os.path.getmtime(path)),
+            })
+    return sorted(backups, key=lambda x: x["modified"], reverse=True)
+
+
+def prune_automatic_backups(keep=14):
+    automatic = [x for x in list_data_backups() if x["name"].endswith("_daily.zip")]
+    for item in automatic[max(int(keep), 1):]:
+        try:
+            os.remove(item["path"])
+        except OSError:
+            pass
+
+
+def ensure_daily_backup():
+    today_code = datetime.now().strftime("%Y%m%d")
+    exists = any(
+        x["name"].startswith(f"lightingsales_{today_code}_")
+        and x["name"].endswith("_daily.zip")
+        for x in list_data_backups()
+    )
+    if not exists:
+        path = create_full_backup("daily", "Bản sao lưu tự động đầu ngày")
+        prune_automatic_backups(14)
+        return path
+    return ""
+
+
+def _validate_backup_archive(zip_path):
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        names = zf.namelist()
+        if sum(info.file_size for info in zf.infolist()) > 2 * 1024 * 1024 * 1024:
+            raise ValueError("Dung lượng giải nén của backup vượt quá giới hạn 2 GB.")
+        for name in names:
+            normalized = name.replace("\\", "/")
+            if normalized.startswith("/") or ".." in normalized.split("/"):
+                raise ValueError("File backup chứa đường dẫn không an toàn.")
+        if "database/lightingsales.db" not in names or "manifest.json" not in names:
+            raise ValueError("Đây không phải file backup đầy đủ của LightingSales CRM.")
+        manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+        if manifest.get("format") != "LightingSales CRM Backup":
+            raise ValueError("Định dạng backup không đúng.")
+        database_bytes = zf.read("database/lightingsales.db")
+        expected_hash = str(manifest.get("database_sha256", "")).strip().lower()
+        actual_hash = hashlib.sha256(database_bytes).hexdigest().lower()
+        if not expected_hash or expected_hash != actual_hash:
+            raise ValueError("Checksum database trong backup không khớp.")
+    return manifest
+
+
+def restore_full_backup(uploaded_bytes):
+    """Khôi phục database và tài sản; luôn tạo backup hiện trạng trước khi phục hồi."""
+    if not uploaded_bytes:
+        raise ValueError("File backup trống.")
+    if len(uploaded_bytes) > 500 * 1024 * 1024:
+        raise ValueError("File backup vượt quá giới hạn 500 MB.")
+
+    with tempfile.TemporaryDirectory(prefix="lightingsales_restore_") as temp_dir:
+        archive_path = os.path.join(temp_dir, "restore.zip")
+        with open(archive_path, "wb") as f:
+            f.write(uploaded_bytes)
+        manifest = _validate_backup_archive(archive_path)
+        pre_restore_path = create_full_backup("pre_restore", "Tự động tạo trước khi khôi phục")
+
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            zf.extractall(temp_dir)
+
+        restored_db_path = os.path.join(temp_dir, "database", "lightingsales.db")
+        restored_conn = sqlite3.connect(restored_db_path)
+        try:
+            check = restored_conn.execute("PRAGMA integrity_check").fetchone()[0]
+            if str(check).lower() != "ok":
+                raise ValueError("Database trong backup bị lỗi.")
+            restored_conn.backup(conn)
+        finally:
+            restored_conn.close()
+
+        for folder_name, destination in (
+            ("product_images", PRODUCT_IMAGE_DIR),
+            ("company_assets", COMPANY_ASSET_DIR),
+        ):
+            source = os.path.join(temp_dir, folder_name)
+            if os.path.isdir(source):
+                shutil.copytree(source, destination, dirs_exist_ok=True)
+        conn.commit()
+    return manifest, pre_restore_path
+
+
+# ============================================================
+# B2 - LỚP CÔNG CỤ CRM AN TOÀN CHO AI AGENT
+# ============================================================
+
+AGENT_ALLOWED_ACTIONS = {
+    "CREATE_ACTIVITY",
+    "RESCHEDULE_ACTIVITY",
+    "COMPLETE_ACTIVITY",
+    "UPDATE_PROJECT_STAGE",
+    "CREATE_QUOTE_DRAFT",
+}
+AGENT_PROJECT_STAGES = {
+    "Tiếp cận", "Khảo sát", "Báo giá", "Thương lượng",
+    "Chốt đơn", "Triển khai", "Hoàn thành", "Tạm dừng"
+}
+AGENT_PRIORITIES = {"High", "Medium", "Low"}
+
+
+class AgentActionError(ValueError):
+    pass
+
+
+def _clean_text(value, field_name, required=False, max_length=2000):
+    text_value = str(value or "").strip()
+    if required and not text_value:
+        raise AgentActionError(f"Thiếu {field_name}.")
+    if len(text_value) > max_length:
+        raise AgentActionError(f"{field_name} vượt quá {max_length} ký tự.")
+    return text_value
+
+
+def _require_positive_id(value, field_name):
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        raise AgentActionError(f"{field_name} không hợp lệ.")
+    if result <= 0:
+        raise AgentActionError(f"{field_name} không hợp lệ.")
+    return result
+
+
+def _require_date(value, field_name="ngày"):
+    parsed = parse_activity_date(value)
+    if parsed is None:
+        raise AgentActionError(f"{field_name} phải theo định dạng dd/mm/yyyy.")
+    return parsed.strftime("%d/%m/%Y")
+
+
+def agent_search_customers(query, limit=20):
+    q = _clean_text(query, "từ khóa", required=True, max_length=200)
+    return pd.read_sql_query("""
+        SELECT id, ten, thoai, ten_cong_ty, dia_chi_cong_ty, phan_loai_kh
+        FROM khach_hang_goc
+        WHERE ten LIKE ? OR thoai LIKE ? OR ten_cong_ty LIKE ?
+        ORDER BY id DESC LIMIT ?
+    """, conn, params=(f"%{q}%", f"%{q}%", f"%{q}%", min(max(int(limit), 1), 100)))
+
+
+def agent_search_projects(query, limit=20):
+    q = _clean_text(query, "từ khóa", required=True, max_length=200)
+    return pd.read_sql_query("""
+        SELECT id, ten_du_an, thoai_khach, dia_chi_cong_trinh,
+               uu_tien, giai_doan, viec_tiep_theo, ngay_theo_doi
+        FROM cong_trinh_new
+        WHERE ten_du_an LIKE ? OR dia_chi_cong_trinh LIKE ? OR thoai_khach LIKE ?
+        ORDER BY id DESC LIMIT ?
+    """, conn, params=(f"%{q}%", f"%{q}%", f"%{q}%", min(max(int(limit), 1), 100)))
+
+
+def agent_find_product_exact(product_code):
+    """Chỉ trả sản phẩm khi mã khớp tuyệt đối; không dùng mã gần giống."""
+    code = _clean_text(product_code, "mã sản phẩm", required=True, max_length=200)
+    rows = pd.read_sql_query("""
+        SELECT id, ma_code, ten_sp, danh_muc, hang, gia_ban, dvt, mo_ta
+        FROM san_pham
+        WHERE ma_code = ? COLLATE BINARY
+        LIMIT 2
+    """, conn, params=(code,))
+    return rows
+
+
+def _agent_log(action_uuid, event_type, action_type="", summary="", payload=None, result=None):
+    cursor.execute("""
+        INSERT INTO agent_action_log
+        (action_uuid, event_type, action_type, summary, payload_json, result_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        str(action_uuid), str(event_type), str(action_type), str(summary or ""),
+        json.dumps(payload or {}, ensure_ascii=False, sort_keys=True),
+        json.dumps(result or {}, ensure_ascii=False, sort_keys=True),
+        datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    ))
+
+
+def queue_agent_action(action_type, payload, summary, requested_by="AI Agent"):
+    action_type = _clean_text(action_type, "loại hành động", required=True, max_length=80).upper()
+    if action_type not in AGENT_ALLOWED_ACTIONS:
+        raise AgentActionError("Hành động này chưa được CRM cho phép.")
+    if not isinstance(payload, dict):
+        raise AgentActionError("Dữ liệu hành động phải là object.")
+    summary = _clean_text(summary, "mô tả hành động", required=True, max_length=500)
+    action_uuid = str(uuid.uuid4())
+    now_text = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    cursor.execute("""
+        INSERT INTO agent_action_queue
+        (action_uuid, action_type, payload_json, summary, status, requested_by, created_at)
+        VALUES (?, ?, ?, ?, 'Chờ duyệt', ?, ?)
+    """, (action_uuid, action_type, payload_json, summary, requested_by, now_text))
+    _agent_log(action_uuid, "QUEUED", action_type, summary, payload=payload)
+    conn.commit()
+    return action_uuid
+
+
+def reject_agent_action(action_uuid, review_note=""):
+    action_uuid = _clean_text(action_uuid, "mã hành động", required=True, max_length=80)
+    row = cursor.execute("""
+        SELECT action_type, summary, payload_json, status
+        FROM agent_action_queue WHERE action_uuid=?
+    """, (action_uuid,)).fetchone()
+    if not row:
+        raise AgentActionError("Không tìm thấy hành động.")
+    if row[3] != "Chờ duyệt":
+        raise AgentActionError("Chỉ có thể từ chối hành động đang chờ duyệt.")
+    now_text = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    cursor.execute("""
+        UPDATE agent_action_queue
+        SET status='Đã từ chối', reviewed_at=?, review_note=?
+        WHERE action_uuid=? AND status='Chờ duyệt'
+    """, (now_text, _clean_text(review_note, "ghi chú", max_length=1000), action_uuid))
+    _agent_log(action_uuid, "REJECTED", row[0], row[1], json.loads(row[2]), {"review_note": review_note})
+    conn.commit()
+
+
+def _execute_agent_tool(action_type, payload):
+    now_text = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+    if action_type == "CREATE_ACTIVITY":
+        project_id = _require_positive_id(payload.get("project_id"), "project_id")
+        project = cursor.execute(
+            "SELECT ten_du_an FROM cong_trinh_new WHERE id=?", (project_id,)
+        ).fetchone()
+        if not project:
+            raise AgentActionError("Không tìm thấy công trình chính xác.")
+        content = _clean_text(payload.get("content"), "nội dung công việc", required=True)
+        due_date = _require_date(payload.get("due_date"), "ngày hẹn")
+        priority = str(payload.get("priority") or "Medium")
+        if priority not in AGENT_PRIORITIES:
+            raise AgentActionError("Mức ưu tiên không hợp lệ.")
+        activity_type = _clean_text(payload.get("activity_type") or "Follow-up", "loại Activity", max_length=100)
+        note = _clean_text(payload.get("note"), "ghi chú")
+        cursor.execute("""
+            INSERT INTO cong_trinh_hoat_dong
+            (cong_trinh_id, loai, noi_dung, ngay_hen, trang_thai, uu_tien, ghi_chu, ngay_tao)
+            VALUES (?, ?, ?, ?, 'Đang làm', ?, ?, ?)
+        """, (project_id, activity_type, content, due_date, priority, note, now_text))
+        activity_id = int(cursor.lastrowid)
+        sync_project_next_action(project_id, commit=False)
+        return {"activity_id": activity_id, "project_id": project_id}
+
+    if action_type == "RESCHEDULE_ACTIVITY":
+        activity_id = _require_positive_id(payload.get("activity_id"), "activity_id")
+        due_date = _require_date(payload.get("due_date"), "ngày hẹn mới")
+        row = cursor.execute("""
+            SELECT cong_trinh_id FROM cong_trinh_hoat_dong
+            WHERE id=? AND trang_thai='Đang làm'
+        """, (activity_id,)).fetchone()
+        if not row:
+            raise AgentActionError("Không tìm thấy Activity đang làm.")
+        note = payload.get("note")
+        if note is None:
+            cursor.execute(
+                "UPDATE cong_trinh_hoat_dong SET ngay_hen=? WHERE id=?",
+                (due_date, activity_id)
+            )
+        else:
+            cursor.execute(
+                "UPDATE cong_trinh_hoat_dong SET ngay_hen=?, ghi_chu=? WHERE id=?",
+                (due_date, _clean_text(note, "ghi chú"), activity_id)
+            )
+        sync_project_next_action(int(row[0]), commit=False)
+        return {"activity_id": activity_id, "due_date": due_date}
+
+    if action_type == "COMPLETE_ACTIVITY":
+        activity_id = _require_positive_id(payload.get("activity_id"), "activity_id")
+        row = cursor.execute("""
+            SELECT a.cong_trinh_id, c.ten_du_an, a.noi_dung, a.ngay_hen, a.ghi_chu
+            FROM cong_trinh_hoat_dong a
+            JOIN cong_trinh_new c ON c.id=a.cong_trinh_id
+            WHERE a.id=? AND a.trang_thai='Đang làm'
+        """, (activity_id,)).fetchone()
+        if not row:
+            raise AgentActionError("Không tìm thấy Activity đang làm.")
+        completion_note = _clean_text(payload.get("note") or row[4], "ghi chú")
+        cursor.execute("""
+            UPDATE cong_trinh_hoat_dong
+            SET trang_thai='Đã hoàn thành', ghi_chu=?, ngay_hoan_thanh=?
+            WHERE id=? AND trang_thai='Đang làm'
+        """, (completion_note, now_text, activity_id))
+        cursor.execute("""
+            INSERT INTO cong_viec_lich_su
+            (cong_trinh_id, ten_du_an, noi_dung, ngay_hen, ghi_chu, ngay_hoan_thanh)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (int(row[0]), row[1], row[2], row[3], completion_note, now_text))
+        sync_project_next_action(int(row[0]), commit=False)
+        return {"activity_id": activity_id, "completed_at": now_text}
+
+    if action_type == "UPDATE_PROJECT_STAGE":
+        project_id = _require_positive_id(payload.get("project_id"), "project_id")
+        stage = _clean_text(payload.get("stage"), "giai đoạn", required=True, max_length=100)
+        if stage not in AGENT_PROJECT_STAGES:
+            raise AgentActionError("Giai đoạn công trình không hợp lệ.")
+        cursor.execute("UPDATE cong_trinh_new SET giai_doan=? WHERE id=?", (stage, project_id))
+        if cursor.rowcount != 1:
+            raise AgentActionError("Không tìm thấy công trình chính xác.")
+        return {"project_id": project_id, "stage": stage}
+
+    if action_type == "CREATE_QUOTE_DRAFT":
+        project_id = _require_positive_id(payload.get("project_id"), "project_id")
+        project = get_project_customer(project_id)
+        if not project:
+            raise AgentActionError("Không tìm thấy công trình chính xác.")
+        quote_date = _require_date(payload.get("quote_date"), "ngày báo giá")
+        if "vat_percent" not in payload:
+            raise AgentActionError("Thiếu VAT; Agent không được tự đoán VAT.")
+        try:
+            vat_percent = float(payload.get("vat_percent"))
+        except (TypeError, ValueError):
+            raise AgentActionError("VAT không hợp lệ.")
+        if not 0 <= vat_percent <= 20:
+            raise AgentActionError("VAT phải nằm trong khoảng 0–20%.")
+        lines = payload.get("lines")
+        if not isinstance(lines, list) or not lines:
+            raise AgentActionError("Báo giá phải có ít nhất một dòng sản phẩm.")
+
+        verified_lines = []
+        for index, line in enumerate(lines, start=1):
+            if not isinstance(line, dict):
+                raise AgentActionError(f"Dòng {index} không hợp lệ.")
+            product_id = _require_positive_id(line.get("product_id"), f"product_id dòng {index}")
+            product_code = _clean_text(line.get("product_code"), f"mã sản phẩm dòng {index}", required=True, max_length=200)
+            product = cursor.execute("""
+                SELECT id, ma_code, ten_sp, hang, mo_ta, dvt
+                FROM san_pham WHERE id=? AND ma_code=? COLLATE BINARY
+            """, (product_id, product_code)).fetchone()
+            if not product:
+                raise AgentActionError(f"Dòng {index}: mã sản phẩm không khớp chính xác.")
+            sku = _clean_text(line.get("sku"), f"SKU dòng {index}", required=True, max_length=200)
+            if "unit_price" not in line:
+                raise AgentActionError(f"Dòng {index}: thiếu đơn giá; Agent không được tự điền giá.")
+            try:
+                quantity = float(line.get("quantity"))
+                unit_price = float(line.get("unit_price"))
+                discount = float(line.get("discount_percent", 0))
+            except (TypeError, ValueError):
+                raise AgentActionError(f"Dòng {index}: số lượng, đơn giá hoặc chiết khấu không hợp lệ.")
+            if quantity <= 0 or unit_price < 0 or not 0 <= discount <= 100:
+                raise AgentActionError(f"Dòng {index}: giá trị số nằm ngoài phạm vi cho phép.")
+            amount = quantity * unit_price * (1 - discount / 100)
+            verified_lines.append({
+                "product": product, "sku": sku, "quantity": quantity,
+                "unit_price": unit_price, "discount": discount, "amount": amount,
+                "description": _clean_text(line.get("description") or product[4], "mô tả"),
+                "note": _clean_text(line.get("note"), "ghi chú dòng"),
+            })
+
+        subtotal = sum(x["amount"] for x in verified_lines)
+        vat_amount = subtotal * vat_percent / 100
+        grand_total = subtotal + vat_amount
+        quote_no = generate_quote_number()
+        cursor.execute("""
+            INSERT INTO bao_gia
+            (so_bao_gia, cong_trinh_id, ten_du_an_snapshot, thoai_khach,
+             ten_khach_snapshot, ngay_bao_gia, trang_thai, ghi_chu, vat_percent,
+             tong_truoc_thue, tien_vat, tong_thanh_toan, ngay_tao, ngay_cap_nhat)
+            VALUES (?, ?, ?, ?, ?, ?, 'Nháp', ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            quote_no, project_id, str(project[1] or ""), str(project[2] or ""),
+            str(project[3] or project[4] or ""), quote_date,
+            _clean_text(payload.get("note"), "ghi chú báo giá"), vat_percent,
+            subtotal, vat_amount, grand_total, now_text, now_text
+        ))
+        quote_id = int(cursor.lastrowid)
+        for item in verified_lines:
+            product = item["product"]
+            cursor.execute("""
+                INSERT INTO bao_gia_chi_tiet
+                (bao_gia_id, san_pham_id, sku, ma_code_snapshot, ten_sp_snapshot,
+                 mo_ta_snapshot, hang_snapshot, dvt_snapshot, so_luong, don_gia,
+                 chiet_khau_percent, thanh_tien, ghi_chu)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                quote_id, int(product[0]), item["sku"], product[1], product[2],
+                item["description"], product[3], product[5], item["quantity"],
+                item["unit_price"], item["discount"], item["amount"], item["note"]
+            ))
+        cursor.execute(
+            "UPDATE cong_trinh_new SET gia_tri_du_kien=? WHERE id=?",
+            (grand_total, project_id)
+        )
+        return {"quote_id": quote_id, "quote_number": quote_no, "total": grand_total}
+
+    raise AgentActionError("Hành động chưa có công cụ thực thi.")
+
+
+def approve_and_execute_agent_action(action_uuid, review_note=""):
+    """Duyệt và thực thi đúng một lần; thất bại sẽ rollback toàn bộ nghiệp vụ."""
+    action_uuid = _clean_text(action_uuid, "mã hành động", required=True, max_length=80)
+    row = cursor.execute("""
+        SELECT action_type, payload_json, summary, status
+        FROM agent_action_queue WHERE action_uuid=?
+    """, (action_uuid,)).fetchone()
+    if not row:
+        raise AgentActionError("Không tìm thấy hành động.")
+    action_type, payload_json, summary, status = row
+    if status != "Chờ duyệt":
+        raise AgentActionError("Hành động này đã được xử lý trước đó.")
+    payload = json.loads(payload_json)
+    now_text = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor.execute("""
+            UPDATE agent_action_queue
+            SET status='Đang thực hiện', reviewed_at=?, review_note=?
+            WHERE action_uuid=? AND status='Chờ duyệt'
+        """, (now_text, _clean_text(review_note, "ghi chú duyệt", max_length=1000), action_uuid))
+        if cursor.rowcount != 1:
+            raise AgentActionError("Hành động đã được phiên khác xử lý.")
+        result = _execute_agent_tool(action_type, payload)
+        cursor.execute("""
+            UPDATE agent_action_queue SET status='Đã thực hiện', error_message=''
+            WHERE action_uuid=?
+        """, (action_uuid,))
+        _agent_log(action_uuid, "EXECUTED", action_type, summary, payload, result)
+        conn.commit()
+        return result
+    except Exception as exc:
+        conn.rollback()
+        cursor.execute("""
+            UPDATE agent_action_queue
+            SET status='Thực hiện lỗi', reviewed_at=?, error_message=?
+            WHERE action_uuid=? AND status='Chờ duyệt'
+        """, (now_text, str(exc)[:1000], action_uuid))
+        _agent_log(action_uuid, "FAILED", action_type, summary, payload, {"error": str(exc)})
+        conn.commit()
+        raise
+
+
+def get_agent_queue(status="Chờ duyệt", limit=100):
+    sql = """
+        SELECT id, action_uuid, action_type, summary, status,
+               requested_by, created_at, reviewed_at, review_note, error_message
+        FROM agent_action_queue
+    """
+    params = []
+    if status:
+        sql += " WHERE status=?"
+        params.append(status)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(min(max(int(limit), 1), 500))
+    return pd.read_sql_query(sql, conn, params=tuple(params))
+
+
+# Tạo tối đa một backup tự động mỗi ngày. Nếu thất bại, CRM vẫn mở và báo tại Cài đặt.
+DAILY_BACKUP_ERROR = ""
+try:
+    ensure_daily_backup()
+except Exception as backup_error:
+    DAILY_BACKUP_ERROR = str(backup_error)
 
 
 # ============================================================
@@ -766,6 +1392,84 @@ with st.sidebar:
                 st.success(message)
             else:
                 st.error(message)
+
+    with st.expander("🛡️ Bảo vệ dữ liệu", expanded=False):
+        try:
+            health = database_health()
+            if health["ok"]:
+                st.success("Database: an toàn")
+            else:
+                st.error(f"Database có lỗi: {health['integrity']}")
+            st.caption(
+                f"{health['table_counts']['khach_hang_goc']} khách hàng • "
+                f"{health['table_counts']['cong_trinh_new']} công trình • "
+                f"{health['table_counts']['bao_gia']} báo giá"
+            )
+        except Exception as health_error:
+            st.error(f"Không kiểm tra được database: {health_error}")
+
+        if DAILY_BACKUP_ERROR:
+            st.warning(f"Backup tự động chưa thành công: {DAILY_BACKUP_ERROR}")
+
+        if st.button("📦 Tạo backup đầy đủ", use_container_width=True, key="create_full_backup_btn"):
+            try:
+                with st.spinner("Đang sao lưu database, ảnh và cấu hình..."):
+                    created_backup = create_full_backup("manual", "Tạo thủ công từ CRM")
+                st.session_state["latest_created_backup"] = created_backup
+                st.success("Đã tạo bản sao lưu đầy đủ.")
+            except Exception as backup_error:
+                st.error(f"Không tạo được backup: {backup_error}")
+
+        available_backups = list_data_backups()
+        if available_backups:
+            latest_backup = available_backups[0]
+            with open(latest_backup["path"], "rb") as backup_file:
+                backup_bytes = backup_file.read()
+            st.download_button(
+                "⬇️ Tải backup mới nhất",
+                data=backup_bytes,
+                file_name=latest_backup["name"],
+                mime="application/zip",
+                use_container_width=True,
+                key="download_latest_backup"
+            )
+            st.caption(
+                f"Mới nhất: {latest_backup['modified'].strftime('%d/%m/%Y %H:%M')} • "
+                f"{latest_backup['size'] / 1024 / 1024:.1f} MB"
+            )
+
+        restore_upload = st.file_uploader(
+            "Khôi phục từ backup ZIP",
+            type=["zip"],
+            key="restore_backup_upload"
+        )
+        restore_confirm = st.checkbox(
+            "Tôi xác nhận khôi phục dữ liệu từ file đã chọn",
+            key="restore_backup_confirm"
+        )
+        if st.button(
+            "♻️ Khôi phục dữ liệu",
+            disabled=restore_upload is None or not restore_confirm,
+            use_container_width=True,
+            key="restore_backup_btn"
+        ):
+            try:
+                with st.spinner("Đang kiểm tra và khôi phục an toàn..."):
+                    restored_manifest, pre_restore = restore_full_backup(restore_upload.getvalue())
+                st.success(
+                    f"Đã khôi phục backup ngày {restored_manifest.get('created_at', 'không xác định')}. "
+                    "CRM cũng đã lưu một bản trước khi khôi phục."
+                )
+                st.rerun()
+            except Exception as restore_error:
+                st.error(f"Không thể khôi phục: {restore_error}")
+
+        pending_actions = int(
+            cursor.execute(
+                "SELECT COUNT(*) FROM agent_action_queue WHERE status='Chờ duyệt'"
+            ).fetchone()[0] or 0
+        )
+        st.caption(f"Agent Safety Engine: sẵn sàng • {pending_actions} hành động chờ duyệt")
     st.caption("SQLite local • Dữ liệu & ảnh không bị ghi đè")
 
 
@@ -775,7 +1479,7 @@ with st.sidebar:
 df_kh, df_ct, df_sp, df_cty_saved = load_data()
 
 # ============================================================
-# V3.3.1 - PROFESSIONAL CRM ROUTING
+# V3.4.0 - DATA SAFETY + AGENT TOOL FOUNDATION
 # ============================================================
 crm_page = page
 page_alias = {
