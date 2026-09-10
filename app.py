@@ -17,6 +17,7 @@ import io
 import zipfile
 import uuid
 import tempfile
+import unicodedata
 from datetime import datetime, timedelta
 
 # ============================================================
@@ -60,7 +61,7 @@ COMPANY_ASSET_DIR = os.path.join(BASE_DIR, "company_assets")
 os.makedirs(COMPANY_ASSET_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "3.4.1"
+APP_VERSION = "3.5.0"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -380,6 +381,19 @@ CREATE TABLE IF NOT EXISTS agent_action_log (
 """)
 
 cursor.execute("""
+CREATE TABLE IF NOT EXISTS agent_chat_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_message TEXT NOT NULL,
+    assistant_message TEXT DEFAULT '',
+    mode TEXT DEFAULT 'Local',
+    intent TEXT DEFAULT 'NONE',
+    proposal_json TEXT DEFAULT '',
+    action_uuid TEXT DEFAULT '',
+    created_at TEXT DEFAULT ''
+)
+""")
+
+cursor.execute("""
 CREATE INDEX IF NOT EXISTS idx_agent_queue_status
 ON agent_action_queue(status, id)
 """)
@@ -392,6 +406,11 @@ ON agent_action_log(action_uuid, id)
 cursor.execute("""
 INSERT OR IGNORE INTO schema_migrations (version, description, applied_at)
 VALUES (3400, 'B1 backup/restore + B2 safe Agent tool layer', ?)
+""", (datetime.now().strftime("%d/%m/%Y %H:%M:%S"),))
+
+cursor.execute("""
+INSERT OR IGNORE INTO schema_migrations (version, description, applied_at)
+VALUES (3500, 'B3 Vietnamese AI Agent Chat + preview workflow', ?)
 """, (datetime.now().strftime("%d/%m/%Y %H:%M:%S"),))
 
 conn.commit()
@@ -629,7 +648,7 @@ def database_health():
     for table_name in (
         "khach_hang_goc", "cong_trinh_new", "cong_trinh_hoat_dong",
         "cong_viec_lich_su", "san_pham", "bao_gia", "bao_gia_chi_tiet",
-        "agent_action_queue", "agent_action_log"
+        "agent_action_queue", "agent_action_log", "agent_chat_history"
     ):
         table_counts[table_name] = int(
             cursor.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0] or 0
@@ -1169,6 +1188,491 @@ def get_agent_queue(status="Chờ duyệt", limit=100):
     return pd.read_sql_query(sql, conn, params=tuple(params))
 
 
+# ============================================================
+# B3 - HIỂU LỆNH TIẾNG VIỆT VÀ TẠO ĐỀ XUẤT CHO AGENT CONTROL
+# ============================================================
+
+def _normalize_vietnamese(value):
+    text_value = unicodedata.normalize("NFD", str(value or "").lower())
+    text_value = "".join(ch for ch in text_value if unicodedata.category(ch) != "Mn")
+    text_value = text_value.replace("đ", "d")
+    return re.sub(r"\s+", " ", text_value).strip()
+
+
+def _parse_vietnamese_command_date(command, today=None):
+    today = today or datetime.now().date()
+    normalized = _normalize_vietnamese(command)
+
+    explicit = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", normalized)
+    if explicit:
+        day, month = int(explicit.group(1)), int(explicit.group(2))
+        year_text = explicit.group(3)
+        year = today.year if not year_text else int(year_text)
+        if year < 100:
+            year += 2000
+        try:
+            candidate = datetime(year, month, day).date()
+        except ValueError:
+            return None
+        if not year_text and candidate < today:
+            try:
+                candidate = datetime(year + 1, month, day).date()
+            except ValueError:
+                return None
+        return candidate.strftime("%d/%m/%Y")
+
+    if "ngay kia" in normalized:
+        return (today + timedelta(days=2)).strftime("%d/%m/%Y")
+    if "ngay mai" in normalized:
+        return (today + timedelta(days=1)).strftime("%d/%m/%Y")
+    if "hom nay" in normalized:
+        return today.strftime("%d/%m/%Y")
+
+    weekday_map = {
+        "thu 2": 0, "thu hai": 0,
+        "thu 3": 1, "thu ba": 1,
+        "thu 4": 2, "thu tu": 2,
+        "thu 5": 3, "thu nam": 3,
+        "thu 6": 4, "thu sau": 4,
+        "thu 7": 5, "thu bay": 5,
+        "chu nhat": 6,
+    }
+    for phrase, weekday in weekday_map.items():
+        if re.search(rf"\b{re.escape(phrase)}\b", normalized):
+            delta = (weekday - today.weekday()) % 7
+            if delta == 0:
+                delta = 7
+            return (today + timedelta(days=delta)).strftime("%d/%m/%Y")
+    return None
+
+
+def _resolve_project_from_command(command):
+    normalized = _normalize_vietnamese(command)
+    projects = cursor.execute("""
+        SELECT id, ten_du_an, giai_doan, uu_tien
+        FROM cong_trinh_new
+        ORDER BY LENGTH(ten_du_an) DESC, id DESC
+    """).fetchall()
+    matches = []
+    for row in projects:
+        project_name = _normalize_vietnamese(row[1])
+        if project_name and project_name in normalized:
+            matches.append(row)
+    if not matches:
+        id_match = re.search(r"(?:cong trinh|du an|project)\s*#?\s*(\d+)\b", normalized)
+        if id_match:
+            row = cursor.execute("""
+                SELECT id, ten_du_an, giai_doan, uu_tien
+                FROM cong_trinh_new WHERE id=?
+            """, (int(id_match.group(1)),)).fetchone()
+            return row, [] if row else []
+        return None, []
+
+    longest_length = len(_normalize_vietnamese(matches[0][1]))
+    strongest = [row for row in matches if len(_normalize_vietnamese(row[1])) == longest_length]
+    if len(strongest) == 1:
+        return strongest[0], matches
+    return None, strongest
+
+
+def _resolve_activity_from_command(command):
+    normalized = _normalize_vietnamese(command)
+    activities = cursor.execute("""
+        SELECT a.id, a.cong_trinh_id, c.ten_du_an, a.noi_dung, a.ngay_hen
+        FROM cong_trinh_hoat_dong a
+        JOIN cong_trinh_new c ON c.id=a.cong_trinh_id
+        WHERE a.trang_thai='Đang làm'
+        ORDER BY a.id DESC
+    """).fetchall()
+
+    id_match = re.search(r"(?:activity|cong viec|viec)\s*#\s*(\d+)\b", normalized)
+    if id_match:
+        matches = [row for row in activities if int(row[0]) == int(id_match.group(1))]
+        return (matches[0] if len(matches) == 1 else None), matches
+
+    matches = []
+    for row in activities:
+        project_name = _normalize_vietnamese(row[2])
+        activity_text = _normalize_vietnamese(row[3])
+        if (project_name and project_name in normalized) or (
+            activity_text and len(activity_text) >= 8 and activity_text in normalized
+        ):
+            matches.append(row)
+    return (matches[0] if len(matches) == 1 else None), matches
+
+
+def interpret_command_locally(command, today=None):
+    """Bộ phân tích an toàn không cần API; chỉ nhận các ý định Bước 3 đã cho phép."""
+    original = _clean_text(command, "yêu cầu", required=True, max_length=3000)
+    normalized = _normalize_vietnamese(original)
+    today = today or datetime.now().date()
+    base = {
+        "intent": "NONE",
+        "confidence": 0.0,
+        "summary": "Chưa xác định được hành động",
+        "explanation": "Agent chưa đủ thông tin để tạo đề xuất an toàn.",
+        "needs_clarification": True,
+        "clarification_question": "Bạn muốn tạo Activity, dời lịch, hoàn thành công việc hay đổi giai đoạn công trình?",
+        "payload": {
+            "project_id": None, "activity_id": None, "activity_type": None,
+            "content": None, "due_date": None, "priority": None,
+            "note": None, "stage": None,
+        },
+    }
+
+    is_complete = any(word in normalized for word in (
+        "hoan thanh", "da thuc hien", "lam xong", "done"
+    ))
+    is_reschedule = any(word in normalized for word in (
+        "doi lich", "doi ngay", "doi han", "doi activity", "doi cong viec",
+        "gia han", "chuyen lich"
+    ))
+    is_stage = any(word in normalized for word in (
+        "giai doan", "stage", "chuyen sang"
+    )) and not is_reschedule
+
+    if is_complete or is_reschedule:
+        activity, matches = _resolve_activity_from_command(original)
+        if activity is None:
+            base["intent"] = "COMPLETE_ACTIVITY" if is_complete else "RESCHEDULE_ACTIVITY"
+            base["clarification_question"] = (
+                "Có nhiều Activity phù hợp. Hãy ghi rõ mã dạng Activity #123."
+                if matches else
+                "Không tìm thấy Activity đang làm. Hãy ghi rõ mã dạng Activity #123."
+            )
+            return base
+        base["payload"]["activity_id"] = int(activity[0])
+        base["payload"]["note"] = original
+        if is_reschedule:
+            due_date = _parse_vietnamese_command_date(original, today)
+            if not due_date:
+                base["intent"] = "RESCHEDULE_ACTIVITY"
+                base["clarification_question"] = "Bạn muốn dời Activity sang ngày nào?"
+                return base
+            base.update({
+                "intent": "RESCHEDULE_ACTIVITY",
+                "confidence": 0.9,
+                "summary": f"Dời Activity #{activity[0]} sang {due_date}",
+                "explanation": f"Đã xác định Activity thuộc công trình {activity[2]}.",
+                "needs_clarification": False,
+                "clarification_question": "",
+            })
+            base["payload"]["due_date"] = due_date
+        else:
+            base.update({
+                "intent": "COMPLETE_ACTIVITY",
+                "confidence": 0.9,
+                "summary": f"Hoàn thành Activity #{activity[0]}",
+                "explanation": f"Đã xác định Activity thuộc công trình {activity[2]}.",
+                "needs_clarification": False,
+                "clarification_question": "",
+            })
+        return base
+
+    if is_stage:
+        project, matches = _resolve_project_from_command(original)
+        if project is None:
+            base["intent"] = "UPDATE_PROJECT_STAGE"
+            base["clarification_question"] = (
+                "Có nhiều công trình phù hợp. Hãy ghi đầy đủ tên công trình hoặc ID."
+                if matches else
+                "Không tìm thấy đúng công trình trong CRM. Hãy ghi đầy đủ tên hoặc ID công trình."
+            )
+            return base
+        selected_stage = None
+        for stage in AGENT_PROJECT_STAGES:
+            if _normalize_vietnamese(stage) in normalized:
+                selected_stage = stage
+                break
+        if not selected_stage:
+            base["intent"] = "UPDATE_PROJECT_STAGE"
+            base["payload"]["project_id"] = int(project[0])
+            base["clarification_question"] = "Bạn muốn chuyển công trình sang giai đoạn nào?"
+            return base
+        base.update({
+            "intent": "UPDATE_PROJECT_STAGE",
+            "confidence": 0.9,
+            "summary": f"Chuyển {project[1]} sang giai đoạn {selected_stage}",
+            "explanation": f"Đã khớp chính xác công trình ID {project[0]}.",
+            "needs_clarification": False,
+            "clarification_question": "",
+        })
+        base["payload"]["project_id"] = int(project[0])
+        base["payload"]["stage"] = selected_stage
+        return base
+
+    create_words = ("tao viec", "them viec", "tao activity", "nhac toi", "nhac minh")
+    if any(word in normalized for word in create_words):
+        project, matches = _resolve_project_from_command(original)
+        due_date = _parse_vietnamese_command_date(original, today)
+        base["intent"] = "CREATE_ACTIVITY"
+        if project is None:
+            base["clarification_question"] = (
+                "Có nhiều công trình phù hợp. Hãy ghi đầy đủ tên công trình hoặc ID."
+                if matches else
+                "Không tìm thấy đúng công trình trong CRM. Hãy ghi đầy đủ tên hoặc ID công trình."
+            )
+            return base
+        if not due_date:
+            base["payload"]["project_id"] = int(project[0])
+            base["clarification_question"] = "Bạn muốn thực hiện công việc này vào ngày nào?"
+            return base
+        activity_type = "Follow-up"
+        if "goi" in normalized:
+            activity_type = "Call"
+        elif "hop" in normalized or "meeting" in normalized:
+            activity_type = "Meeting"
+        elif "khao sat" in normalized:
+            activity_type = "Site Survey"
+        elif "deadline" in normalized:
+            activity_type = "Deadline"
+        priority = "High" if any(x in normalized for x in ("uu tien cao", "gap", "khan")) else "Medium"
+        base.update({
+            "intent": "CREATE_ACTIVITY",
+            "confidence": 0.82,
+            "summary": f"Tạo {activity_type} cho {project[1]} vào {due_date}",
+            "explanation": "Chế độ cục bộ giữ nguyên câu lệnh làm nội dung để bạn kiểm tra trước khi duyệt.",
+            "needs_clarification": False,
+            "clarification_question": "",
+        })
+        base["payload"].update({
+            "project_id": int(project[0]),
+            "activity_type": activity_type,
+            "content": original,
+            "due_date": due_date,
+            "priority": priority,
+            "note": "Tạo từ Vietnamese AI Agent",
+        })
+        return base
+
+    return base
+
+
+def _crm_context_for_ai():
+    projects = [
+        {
+            "id": int(row[0]), "name": str(row[1] or ""),
+            "stage": str(row[2] or ""), "priority": str(row[3] or "")
+        }
+        for row in cursor.execute("""
+            SELECT id, ten_du_an, giai_doan, uu_tien
+            FROM cong_trinh_new ORDER BY id DESC LIMIT 100
+        """).fetchall()
+    ]
+    activities = [
+        {
+            "id": int(row[0]), "project_id": int(row[1]),
+            "project": str(row[2] or ""), "content": str(row[3] or ""),
+            "due_date": str(row[4] or "")
+        }
+        for row in cursor.execute("""
+            SELECT a.id, a.cong_trinh_id, c.ten_du_an, a.noi_dung, a.ngay_hen
+            FROM cong_trinh_hoat_dong a
+            JOIN cong_trinh_new c ON c.id=a.cong_trinh_id
+            WHERE a.trang_thai='Đang làm'
+            ORDER BY a.id DESC LIMIT 100
+        """).fetchall()
+    ]
+    return {"projects": projects, "open_activities": activities}
+
+
+def _nullable_schema(json_type):
+    return {"anyOf": [{"type": json_type}, {"type": "null"}]}
+
+
+def interpret_command_with_openai(command, api_key, model="gpt-5-mini"):
+    api_key = _clean_text(api_key, "OpenAI API key", required=True, max_length=500)
+    model = _clean_text(model, "model", required=True, max_length=100)
+    user_command = _clean_text(command, "yêu cầu", required=True, max_length=3000)
+    crm_context = _crm_context_for_ai()
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string", "enum": [
+                "CREATE_ACTIVITY", "RESCHEDULE_ACTIVITY", "COMPLETE_ACTIVITY",
+                "UPDATE_PROJECT_STAGE", "NONE"
+            ]},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "summary": {"type": "string"},
+            "explanation": {"type": "string"},
+            "needs_clarification": {"type": "boolean"},
+            "clarification_question": {"type": "string"},
+            "payload": {
+                "type": "object",
+                "properties": {
+                    "project_id": _nullable_schema("integer"),
+                    "activity_id": _nullable_schema("integer"),
+                    "activity_type": _nullable_schema("string"),
+                    "content": _nullable_schema("string"),
+                    "due_date": _nullable_schema("string"),
+                    "priority": _nullable_schema("string"),
+                    "note": _nullable_schema("string"),
+                    "stage": _nullable_schema("string"),
+                },
+                "required": [
+                    "project_id", "activity_id", "activity_type", "content",
+                    "due_date", "priority", "note", "stage"
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "required": [
+            "intent", "confidence", "summary", "explanation",
+            "needs_clarification", "clarification_question", "payload"
+        ],
+        "additionalProperties": False,
+    }
+    instructions = (
+        "Bạn là bộ phân tích lệnh tiếng Việt cho LightingSales CRM. "
+        "Chỉ chọn một intent trong schema. Chỉ dùng ID có trong CRM_CONTEXT; "
+        "không đoán, không dùng tên gần giống, không tự tạo dữ liệu thiếu. "
+        "Nếu không xác định duy nhất công trình hoặc Activity, đặt needs_clarification=true. "
+        "Ngày phải là dd/mm/yyyy. Hôm nay là "
+        f"{datetime.now().strftime('%d/%m/%Y')}. "
+        "Mọi hành động chỉ là đề xuất và sẽ cần người dùng phê duyệt."
+    )
+    request_body = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": (
+                "CRM_CONTEXT:\n" + json.dumps(crm_context, ensure_ascii=False) +
+                "\n\nUSER_COMMAND:\n" + user_command
+            )},
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "lighting_crm_agent_proposal",
+                "strict": True,
+                "schema": schema,
+            }
+        },
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": f"LightingSales-CRM/{APP_VERSION}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:1000]
+        raise AgentActionError(f"OpenAI API trả lỗi HTTP {exc.code}: {detail}")
+    except Exception as exc:
+        raise AgentActionError(f"Không kết nối được OpenAI API: {exc}")
+
+    output_text = ""
+    for output_item in response_data.get("output", []):
+        if output_item.get("type") != "message":
+            continue
+        for content_item in output_item.get("content", []):
+            if content_item.get("type") == "refusal":
+                raise AgentActionError(content_item.get("refusal") or "AI từ chối xử lý yêu cầu.")
+            if content_item.get("type") == "output_text":
+                output_text += str(content_item.get("text") or "")
+    if not output_text.strip():
+        raise AgentActionError("OpenAI API không trả về nội dung có thể xử lý.")
+    try:
+        return json.loads(output_text)
+    except json.JSONDecodeError:
+        raise AgentActionError("Phản hồi AI không phải JSON hợp lệ.")
+
+
+def validate_agent_proposal(proposal):
+    if not isinstance(proposal, dict):
+        raise AgentActionError("Đề xuất Agent không hợp lệ.")
+    if proposal.get("needs_clarification"):
+        raise AgentActionError(
+            proposal.get("clarification_question") or "Agent cần thêm thông tin."
+        )
+    intent = str(proposal.get("intent") or "NONE").upper()
+    if intent not in AGENT_ALLOWED_ACTIONS or intent == "CREATE_QUOTE_DRAFT":
+        raise AgentActionError("Bước 3 chưa cho phép hành động này.")
+    payload = proposal.get("payload")
+    if not isinstance(payload, dict):
+        raise AgentActionError("Payload đề xuất không hợp lệ.")
+
+    if intent == "CREATE_ACTIVITY":
+        project_id = _require_positive_id(payload.get("project_id"), "project_id")
+        if not cursor.execute("SELECT 1 FROM cong_trinh_new WHERE id=?", (project_id,)).fetchone():
+            raise AgentActionError("Không tìm thấy chính xác công trình.")
+        cleaned_payload = {
+            "project_id": project_id,
+            "activity_type": _clean_text(payload.get("activity_type") or "Follow-up", "loại Activity", max_length=100),
+            "content": _clean_text(payload.get("content"), "nội dung", required=True),
+            "due_date": _require_date(payload.get("due_date"), "ngày hẹn"),
+            "priority": str(payload.get("priority") or "Medium"),
+            "note": _clean_text(payload.get("note"), "ghi chú"),
+        }
+        if cleaned_payload["priority"] not in AGENT_PRIORITIES:
+            raise AgentActionError("Mức ưu tiên không hợp lệ.")
+    elif intent == "RESCHEDULE_ACTIVITY":
+        activity_id = _require_positive_id(payload.get("activity_id"), "activity_id")
+        if not cursor.execute(
+            "SELECT 1 FROM cong_trinh_hoat_dong WHERE id=? AND trang_thai='Đang làm'",
+            (activity_id,)
+        ).fetchone():
+            raise AgentActionError("Không tìm thấy chính xác Activity đang làm.")
+        cleaned_payload = {
+            "activity_id": activity_id,
+            "due_date": _require_date(payload.get("due_date"), "ngày hẹn mới"),
+            "note": _clean_text(payload.get("note"), "ghi chú"),
+        }
+    elif intent == "COMPLETE_ACTIVITY":
+        activity_id = _require_positive_id(payload.get("activity_id"), "activity_id")
+        if not cursor.execute(
+            "SELECT 1 FROM cong_trinh_hoat_dong WHERE id=? AND trang_thai='Đang làm'",
+            (activity_id,)
+        ).fetchone():
+            raise AgentActionError("Không tìm thấy chính xác Activity đang làm.")
+        cleaned_payload = {
+            "activity_id": activity_id,
+            "note": _clean_text(payload.get("note"), "ghi chú"),
+        }
+    else:
+        project_id = _require_positive_id(payload.get("project_id"), "project_id")
+        if not cursor.execute("SELECT 1 FROM cong_trinh_new WHERE id=?", (project_id,)).fetchone():
+            raise AgentActionError("Không tìm thấy chính xác công trình.")
+        stage = _clean_text(payload.get("stage"), "giai đoạn", required=True, max_length=100)
+        if stage not in AGENT_PROJECT_STAGES:
+            raise AgentActionError("Giai đoạn không hợp lệ.")
+        cleaned_payload = {"project_id": project_id, "stage": stage}
+
+    summary = _clean_text(proposal.get("summary"), "tóm tắt", required=True, max_length=500)
+    return intent, cleaned_payload, summary
+
+
+def save_agent_chat(user_message, proposal, mode):
+    assistant_message = str(proposal.get("explanation") or proposal.get("summary") or "")
+    cursor.execute("""
+        INSERT INTO agent_chat_history
+        (user_message, assistant_message, mode, intent, proposal_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        str(user_message), assistant_message, str(mode), str(proposal.get("intent") or "NONE"),
+        json.dumps(proposal, ensure_ascii=False, sort_keys=True),
+        datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    ))
+    conn.commit()
+    return int(cursor.lastrowid)
+
+
+def link_chat_to_action(chat_id, action_uuid):
+    cursor.execute(
+        "UPDATE agent_chat_history SET action_uuid=? WHERE id=?",
+        (str(action_uuid), int(chat_id))
+    )
+    conn.commit()
+
+
 # Tạo tối đa một backup tự động mỗi ngày. Nếu thất bại, CRM vẫn mở và báo tại Cài đặt.
 DAILY_BACKUP_ERROR = ""
 try:
@@ -1364,7 +1868,7 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section">MENU CHÍNH</div>', unsafe_allow_html=True)
     page = st.radio(
         "Điều hướng",
-        ["⌂  Home", "◎  Deals", "✓  Activities", "🧾  Quotations", "♙  Customers", "▦  Products", "🛡  Agent Control", "⚙  Settings"],
+        ["⌂  Home", "◎  Deals", "✓  Activities", "🧾  Quotations", "♙  Customers", "▦  Products", "🤖  AI Agent", "🛡  Agent Control", "⚙  Settings"],
         label_visibility="collapsed",
         key="main_navigation"
     )
@@ -1488,6 +1992,7 @@ page_alias = {
     "🧾  Quotations": "🧾  Báo giá",
     "♙  Customers": "👥  Khách hàng",
     "▦  Products": "📦  Sản phẩm",
+    "🤖  AI Agent": "🤖  AI Agent",
     "🛡  Agent Control": "🛡️  Agent Control",
     "⚙  Settings": "🏢  Thông tin công ty",
 }
@@ -3265,6 +3770,193 @@ if page == "📦  Sản phẩm":
             sp_del_id=st.selectbox("Chọn sản phẩm cần xóa",df_sp["id"].tolist(),format_func=lambda x:f"{df_sp.loc[df_sp['id']==x,'ma_code'].values[0]} - {df_sp.loc[df_sp['id']==x,'ten_sp'].values[0]}",key="sp_delete_id")
             if st.button("❌ Xác nhận xóa sản phẩm",type="primary",key="delete_product_btn"):
                 cursor.execute("DELETE FROM san_pham WHERE id=?",(sp_del_id,)); conn.commit(); st.success("🎉 Đã xóa sản phẩm!"); st.rerun()
+
+
+# ============================================================
+# B3 - VIETNAMESE AI AGENT CHAT
+# ============================================================
+
+if page == "🤖  AI Agent":
+    page_header(
+        "Vietnamese AI Agent",
+        "Ra lệnh bằng tiếng Việt, kiểm tra cách Agent hiểu và chuyển đề xuất sang Agent Control để phê duyệt.",
+        "LIGHTINGSALES AI"
+    )
+
+    st.info(
+        "🔒 Agent không thực hiện trực tiếp. Mọi thay đổi luôn đi qua "
+        "Agent Control và chờ bạn phê duyệt."
+    )
+
+    with st.expander("⚙️ Chế độ phân tích", expanded=False):
+        agent_mode = st.radio(
+            "Chọn chế độ",
+            ["Cục bộ — không cần API", "OpenAI API — hiểu câu linh hoạt hơn"],
+            horizontal=True,
+            key="agent_interpreter_mode"
+        )
+        if agent_mode.startswith("OpenAI"):
+            env_api_key = str(os.environ.get("OPENAI_API_KEY", "") or "").strip()
+            agent_api_key = st.text_input(
+                "OpenAI API key",
+                value="",
+                type="password",
+                placeholder="sk-...",
+                help="Khóa chỉ giữ trong phiên chạy hiện tại, không lưu vào database hoặc nhật ký.",
+                key="agent_api_key_input"
+            )
+            agent_model = st.text_input(
+                "Model",
+                value=str(os.environ.get("LIGHTINGSALES_AI_MODEL", "gpt-5-mini")),
+                key="agent_model_input"
+            )
+            effective_api_key = agent_api_key.strip() or env_api_key
+            if effective_api_key:
+                st.success("Đã có API key cho phiên hiện tại.")
+            else:
+                st.warning("Chưa có API key. Bạn vẫn có thể chuyển sang chế độ Cục bộ.")
+            st.caption(
+                "Chế độ API chỉ gửi câu lệnh cùng ID, tên, giai đoạn công trình và Activity đang mở; "
+                "không gửi giá bán, báo giá hoặc số điện thoại khách hàng."
+            )
+        else:
+            effective_api_key = ""
+            agent_model = ""
+            st.caption(
+                "Chế độ cục bộ xử lý các lệnh tạo Activity, dời lịch, hoàn thành Activity "
+                "và đổi giai đoạn mà không cần kết nối AI bên ngoài."
+            )
+
+    example_col1, example_col2 = st.columns(2)
+    with example_col1:
+        st.caption("Ví dụ: Tạo việc gọi khách cho dự án Villa Thảo Điền vào thứ Sáu, ưu tiên cao.")
+    with example_col2:
+        st.caption("Ví dụ: Chuyển dự án Showroom Quận 1 sang giai đoạn Báo giá.")
+
+    agent_command = st.text_area(
+        "Bạn muốn Agent làm gì?",
+        placeholder=(
+            "Nhập một yêu cầu cụ thể, có tên công trình và ngày thực hiện. "
+            "Ví dụ: Tạo việc gọi khách cho dự án ABC vào ngày mai."
+        ),
+        height=120,
+        key="agent_command_input"
+    )
+
+    analyze_col, clear_col = st.columns([2, 1])
+    with analyze_col:
+        analyze_command = st.button(
+            "✨ Phân tích yêu cầu",
+            type="primary",
+            use_container_width=True,
+            key="agent_analyze_command"
+        )
+    with clear_col:
+        if st.button(
+            "🧹 Xóa kết quả",
+            use_container_width=True,
+            key="agent_clear_result"
+        ):
+            st.session_state.pop("agent_last_proposal", None)
+            st.session_state.pop("agent_last_chat_id", None)
+            st.session_state.pop("agent_last_action_uuid", None)
+            st.rerun()
+
+    if analyze_command:
+        if not agent_command.strip():
+            st.warning("Vui lòng nhập yêu cầu cho Agent.")
+        elif agent_mode.startswith("OpenAI") and not effective_api_key:
+            st.warning("Vui lòng nhập OpenAI API key hoặc chuyển sang chế độ Cục bộ.")
+        else:
+            try:
+                with st.spinner("Agent đang đọc yêu cầu và đối chiếu CRM..."):
+                    if agent_mode.startswith("OpenAI"):
+                        proposal = interpret_command_with_openai(
+                            agent_command, effective_api_key, agent_model
+                        )
+                        saved_mode = f"OpenAI API / {agent_model}"
+                    else:
+                        proposal = interpret_command_locally(agent_command)
+                        saved_mode = "Local"
+                    chat_id = save_agent_chat(agent_command, proposal, saved_mode)
+                st.session_state["agent_last_proposal"] = proposal
+                st.session_state["agent_last_chat_id"] = chat_id
+                st.session_state.pop("agent_last_action_uuid", None)
+            except Exception as agent_error:
+                st.error(f"Agent chưa thể phân tích yêu cầu: {agent_error}")
+
+    proposal = st.session_state.get("agent_last_proposal")
+    if proposal:
+        st.markdown("---")
+        st.markdown("### 👀 Bản xem trước")
+        preview_left, preview_right = st.columns([2.2, 1])
+        with preview_left:
+            st.markdown(f"#### {proposal.get('summary') or 'Đề xuất của Agent'}")
+            st.write(proposal.get("explanation") or "")
+        with preview_right:
+            confidence_value = float(proposal.get("confidence") or 0)
+            st.metric("Độ tin cậy", f"{confidence_value * 100:.0f}%")
+            st.caption(f"Intent: {proposal.get('intent', 'NONE')}")
+
+        if proposal.get("needs_clarification"):
+            st.warning(
+                proposal.get("clarification_question")
+                or "Agent cần thêm thông tin trước khi tạo đề xuất."
+            )
+        else:
+            try:
+                safe_intent, safe_payload, safe_summary = validate_agent_proposal(proposal)
+                st.success("Đề xuất đã vượt qua kiểm tra an toàn sơ bộ.")
+                with st.expander("🔍 Xem chính xác dữ liệu sẽ chuyển sang Agent Control"):
+                    st.json({
+                        "action_type": safe_intent,
+                        "summary": safe_summary,
+                        "payload": safe_payload,
+                    })
+
+                existing_action_uuid = st.session_state.get("agent_last_action_uuid")
+                if existing_action_uuid:
+                    st.success(
+                        f"Đã chuyển sang Agent Control — mã {existing_action_uuid[:8]}. "
+                        "Hãy vào Agent Control để duyệt hoặc từ chối."
+                    )
+                elif st.button(
+                    "➡️ Đưa sang Agent Control",
+                    type="primary",
+                    use_container_width=True,
+                    key="agent_send_to_control"
+                ):
+                    action_uuid = queue_agent_action(
+                        safe_intent,
+                        safe_payload,
+                        safe_summary,
+                        "Vietnamese AI Agent"
+                    )
+                    chat_id = st.session_state.get("agent_last_chat_id")
+                    if chat_id:
+                        link_chat_to_action(chat_id, action_uuid)
+                    st.session_state["agent_last_action_uuid"] = action_uuid
+                    st.success(
+                        f"Đã chuyển sang Agent Control — mã {action_uuid[:8]}."
+                    )
+                    st.rerun()
+            except Exception as validation_error:
+                st.error(f"Đề xuất bị chặn bởi lớp an toàn: {validation_error}")
+
+    with st.expander("🕘 Lịch sử trao đổi gần đây", expanded=False):
+        chat_history_df = pd.read_sql_query("""
+            SELECT id, user_message, mode, intent, action_uuid, created_at
+            FROM agent_chat_history
+            ORDER BY id DESC
+            LIMIT 30
+        """, conn)
+        if chat_history_df.empty:
+            st.caption("Chưa có câu lệnh nào.")
+        else:
+            chat_show = chat_history_df.copy()
+            chat_show["action_uuid"] = chat_show["action_uuid"].fillna("").astype(str).str[:8]
+            chat_show.columns = ["ID", "Yêu cầu", "Chế độ", "Intent", "Mã hành động", "Thời điểm"]
+            st.dataframe(chat_show, width="stretch", hide_index=True)
 
 
 # ============================================================

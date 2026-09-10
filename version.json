@@ -1,6 +1,6 @@
 {
-  "version": "3.4.1",
+  "version": "3.5.0",
   "app_url": "https://raw.githubusercontent.com/cxthanhcara-debug/LightingSales-CRM/main/app.py",
-  "sha256": "6a826b58bc556ceb84fe1733f9079bee0dc765ea3578744d4fdec8baf228df4b",
-  "notes": "v3.4.1 - Hoàn thiện Bước 2 với Agent Control Center: hàng chờ phê duyệt, xem payload trước khi thực hiện, duyệt hoặc từ chối, nhật ký kiểm toán, form chạy thử tạo/dời/hoàn thành Activity và đổi giai đoạn công trình. Tiếp tục giữ backup, exact-match và rollback an toàn của v3.4.0."
+  "sha256": "a2ab53e24396a5db514ef7f9667df84bd44bb663240f99a2a2c2b7ff0d5d31f9",
+  "notes": "v3.5.0 - Bước 3 Vietnamese AI Agent Chat: thêm màn hình nhập lệnh tiếng Việt, chế độ cục bộ không cần API, chế độ OpenAI API tùy chọn với Structured Outputs, đối chiếu ID công trình/Activity, phát hiện thiếu hoặc trùng dữ liệu, bản xem trước, lịch sử chat và chuyển đề xuất sang Agent Control để người dùng phê duyệt. Không tự thực hiện hoặc tự đoán dữ liệu."
 }
