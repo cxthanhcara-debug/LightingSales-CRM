@@ -62,7 +62,7 @@ COMPANY_ASSET_DIR = os.path.join(BASE_DIR, "company_assets")
 os.makedirs(COMPANY_ASSET_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.7.0"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -364,7 +364,8 @@ CREATE TABLE IF NOT EXISTS agent_action_queue (
     created_at TEXT DEFAULT '',
     reviewed_at TEXT DEFAULT '',
     review_note TEXT DEFAULT '',
-    error_message TEXT DEFAULT ''
+    error_message TEXT DEFAULT '',
+    automation_key TEXT DEFAULT ''
 )
 """)
 
@@ -395,6 +396,43 @@ CREATE TABLE IF NOT EXISTS agent_chat_history (
 """)
 
 cursor.execute("""
+CREATE TABLE IF NOT EXISTS agent_automation_settings (
+    id INTEGER PRIMARY KEY CHECK (id=1),
+    enabled INTEGER DEFAULT 0,
+    overdue_enabled INTEGER DEFAULT 1,
+    overdue_offset_days INTEGER DEFAULT 1,
+    stalled_enabled INTEGER DEFAULT 1,
+    stalled_days INTEGER DEFAULT 14,
+    quote_followup_enabled INTEGER DEFAULT 1,
+    quote_followup_days INTEGER DEFAULT 3,
+    followup_offset_days INTEGER DEFAULT 1,
+    default_priority TEXT DEFAULT 'Medium',
+    last_scan_date TEXT DEFAULT '',
+    last_scan_at TEXT DEFAULT '',
+    updated_at TEXT DEFAULT ''
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS agent_automation_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trigger_type TEXT DEFAULT 'Manual',
+    status TEXT DEFAULT 'Hoàn thành',
+    candidates_count INTEGER DEFAULT 0,
+    queued_count INTEGER DEFAULT 0,
+    skipped_count INTEGER DEFAULT 0,
+    detail_json TEXT DEFAULT '',
+    error_message TEXT DEFAULT '',
+    created_at TEXT DEFAULT ''
+)
+""")
+
+cursor.execute("""
+INSERT OR IGNORE INTO agent_automation_settings (id, updated_at)
+VALUES (1, ?)
+""", (datetime.now().strftime("%d/%m/%Y %H:%M:%S"),))
+
+cursor.execute("""
 CREATE INDEX IF NOT EXISTS idx_agent_queue_status
 ON agent_action_queue(status, id)
 """)
@@ -419,6 +457,11 @@ INSERT OR IGNORE INTO schema_migrations (version, description, applied_at)
 VALUES (3600, 'B4 AI quotation builder + Excel exact SKU validation', ?)
 """, (datetime.now().strftime("%d/%m/%Y %H:%M:%S"),))
 
+cursor.execute("""
+INSERT OR IGNORE INTO schema_migrations (version, description, applied_at)
+VALUES (3700, 'B5 safe daily Agent Automation and proactive follow-up', ?)
+""", (datetime.now().strftime("%d/%m/%Y %H:%M:%S"),))
+
 conn.commit()
 
 cursor.execute("""
@@ -438,6 +481,12 @@ ensure_column("cong_trinh_new", "gia_tri_du_kien", "REAL DEFAULT 0")
 ensure_column("san_pham", "mo_ta", "TEXT DEFAULT ''")
 ensure_column("san_pham", "hinh_anh", "TEXT DEFAULT ''")
 ensure_column("cau_hinh_doanh_nghiep", "logo_path", "TEXT DEFAULT ''")
+ensure_column("agent_action_queue", "automation_key", "TEXT DEFAULT ''")
+cursor.execute("""
+CREATE INDEX IF NOT EXISTS idx_agent_queue_automation_key
+ON agent_action_queue(automation_key)
+""")
+conn.commit()
 
 
 # Chuyển công việc hiện có sang Activity Manager một lần, không tạo trùng.
@@ -924,21 +973,34 @@ def _agent_log(action_uuid, event_type, action_type="", summary="", payload=None
     ))
 
 
-def queue_agent_action(action_type, payload, summary, requested_by="AI Agent"):
+def queue_agent_action(
+    action_type, payload, summary, requested_by="AI Agent", automation_key=""
+):
     action_type = _clean_text(action_type, "loại hành động", required=True, max_length=80).upper()
     if action_type not in AGENT_ALLOWED_ACTIONS:
         raise AgentActionError("Hành động này chưa được CRM cho phép.")
     if not isinstance(payload, dict):
         raise AgentActionError("Dữ liệu hành động phải là object.")
     summary = _clean_text(summary, "mô tả hành động", required=True, max_length=500)
+    automation_key = _clean_text(automation_key, "automation_key", max_length=300)
+    if automation_key:
+        existing = cursor.execute(
+            "SELECT action_uuid FROM agent_action_queue WHERE automation_key=? LIMIT 1",
+            (automation_key,)
+        ).fetchone()
+        if existing:
+            return str(existing[0])
     action_uuid = str(uuid.uuid4())
     now_text = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     cursor.execute("""
         INSERT INTO agent_action_queue
-        (action_uuid, action_type, payload_json, summary, status, requested_by, created_at)
-        VALUES (?, ?, ?, ?, 'Chờ duyệt', ?, ?)
-    """, (action_uuid, action_type, payload_json, summary, requested_by, now_text))
+        (action_uuid, action_type, payload_json, summary, status, requested_by, created_at, automation_key)
+        VALUES (?, ?, ?, ?, 'Chờ duyệt', ?, ?, ?)
+    """, (
+        action_uuid, action_type, payload_json, summary,
+        requested_by, now_text, automation_key
+    ))
     _agent_log(action_uuid, "QUEUED", action_type, summary, payload=payload)
     conn.commit()
     return action_uuid
@@ -1199,6 +1261,292 @@ def get_agent_queue(status="Chờ duyệt", limit=100):
     sql += " ORDER BY id DESC LIMIT ?"
     params.append(min(max(int(limit), 1), 500))
     return pd.read_sql_query(sql, conn, params=tuple(params))
+
+
+# ============================================================
+# B5 - AGENT AUTOMATION AN TOÀN, CHỈ TẠO ĐỀ XUẤT
+# ============================================================
+
+def _parse_crm_datetime(value):
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    for date_format in (
+        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(text_value, date_format)
+        except ValueError:
+            continue
+    return None
+
+
+def get_agent_automation_settings():
+    row = cursor.execute("""
+        SELECT enabled, overdue_enabled, overdue_offset_days,
+               stalled_enabled, stalled_days, quote_followup_enabled,
+               quote_followup_days, followup_offset_days, default_priority,
+               last_scan_date, last_scan_at, updated_at
+        FROM agent_automation_settings WHERE id=1
+    """).fetchone()
+    if not row:
+        raise AgentActionError("Không đọc được cấu hình Agent Automation.")
+    keys = [
+        "enabled", "overdue_enabled", "overdue_offset_days",
+        "stalled_enabled", "stalled_days", "quote_followup_enabled",
+        "quote_followup_days", "followup_offset_days", "default_priority",
+        "last_scan_date", "last_scan_at", "updated_at",
+    ]
+    settings = dict(zip(keys, row))
+    for key in ("enabled", "overdue_enabled", "stalled_enabled", "quote_followup_enabled"):
+        settings[key] = bool(settings[key])
+    for key in ("overdue_offset_days", "stalled_days", "quote_followup_days", "followup_offset_days"):
+        settings[key] = int(settings[key] or 0)
+    return settings
+
+
+def save_agent_automation_settings(settings):
+    if not isinstance(settings, dict):
+        raise AgentActionError("Cấu hình Automation không hợp lệ.")
+    overdue_offset = int(settings.get("overdue_offset_days", 1))
+    stalled_days = int(settings.get("stalled_days", 14))
+    quote_days = int(settings.get("quote_followup_days", 3))
+    followup_offset = int(settings.get("followup_offset_days", 1))
+    if not 1 <= overdue_offset <= 30:
+        raise AgentActionError("Số ngày dời việc quá hạn phải từ 1–30.")
+    if not 1 <= stalled_days <= 365:
+        raise AgentActionError("Ngưỡng dự án chưa chăm sóc phải từ 1–365 ngày.")
+    if not 1 <= quote_days <= 365:
+        raise AgentActionError("Ngưỡng follow-up báo giá phải từ 1–365 ngày.")
+    if not 1 <= followup_offset <= 30:
+        raise AgentActionError("Ngày hẹn mới phải cách hiện tại từ 1–30 ngày.")
+    priority = str(settings.get("default_priority") or "Medium")
+    if priority not in AGENT_PRIORITIES:
+        raise AgentActionError("Mức ưu tiên mặc định không hợp lệ.")
+    now_text = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    cursor.execute("""
+        UPDATE agent_automation_settings
+        SET enabled=?, overdue_enabled=?, overdue_offset_days=?,
+            stalled_enabled=?, stalled_days=?, quote_followup_enabled=?,
+            quote_followup_days=?, followup_offset_days=?, default_priority=?, updated_at=?
+        WHERE id=1
+    """, (
+        int(bool(settings.get("enabled"))),
+        int(bool(settings.get("overdue_enabled"))), overdue_offset,
+        int(bool(settings.get("stalled_enabled"))), stalled_days,
+        int(bool(settings.get("quote_followup_enabled"))), quote_days,
+        followup_offset, priority, now_text,
+    ))
+    conn.commit()
+
+
+def _automation_key_exists(automation_key):
+    return bool(cursor.execute(
+        "SELECT 1 FROM agent_action_queue WHERE automation_key=? LIMIT 1",
+        (str(automation_key),)
+    ).fetchone())
+
+
+def get_agent_automation_candidates(today=None):
+    """Sinh đề xuất theo quy tắc đã lưu; không ghi hoặc thay đổi nghiệp vụ CRM."""
+    today = today or datetime.now().date()
+    settings = get_agent_automation_settings()
+    candidates = []
+    default_priority = settings["default_priority"]
+
+    if settings["overdue_enabled"]:
+        rows = cursor.execute("""
+            SELECT a.id, a.cong_trinh_id, c.ten_du_an, a.noi_dung,
+                   a.ngay_hen, a.uu_tien
+            FROM cong_trinh_hoat_dong a
+            JOIN cong_trinh_new c ON c.id=a.cong_trinh_id
+            WHERE a.trang_thai='Đang làm'
+            ORDER BY a.id
+        """).fetchall()
+        new_due = (today + timedelta(days=settings["overdue_offset_days"])).strftime("%d/%m/%Y")
+        for row in rows:
+            due_dt = _parse_crm_datetime(row[4])
+            if not due_dt or due_dt.date() >= today:
+                continue
+            automation_key = f"OVERDUE:{int(row[0])}:{due_dt.strftime('%Y-%m-%d')}"
+            candidates.append({
+                "rule": "Việc quá hạn", "automation_key": automation_key,
+                "action_type": "RESCHEDULE_ACTIVITY",
+                "summary": f"Dời Activity #{int(row[0])} quá hạn sang {new_due}",
+                "detail": f"{row[2]} — {row[3]}",
+                "payload": {
+                    "activity_id": int(row[0]), "due_date": new_due,
+                },
+                "already_processed": _automation_key_exists(automation_key),
+            })
+
+    if settings["stalled_enabled"]:
+        project_rows = cursor.execute("""
+            SELECT id, ten_du_an, giai_doan, uu_tien, ngay_khoi_tao
+            FROM cong_trinh_new
+            WHERE COALESCE(giai_doan, '') NOT IN ('Hoàn thành', 'Tạm dừng')
+            ORDER BY id
+        """).fetchall()
+        activity_rows = cursor.execute("""
+            SELECT cong_trinh_id, ngay_tao, ngay_hoan_thanh
+            FROM cong_trinh_hoat_dong
+        """).fetchall()
+        latest_activity = {}
+        for activity in activity_rows:
+            project_id = int(activity[0])
+            for raw_date in (activity[1], activity[2]):
+                parsed = _parse_crm_datetime(raw_date)
+                if parsed and (project_id not in latest_activity or parsed > latest_activity[project_id]):
+                    latest_activity[project_id] = parsed
+        open_project_ids = {
+            int(row[0]) for row in cursor.execute("""
+                SELECT DISTINCT cong_trinh_id FROM cong_trinh_hoat_dong
+                WHERE trang_thai='Đang làm'
+            """).fetchall()
+        }
+        follow_due = (today + timedelta(days=settings["followup_offset_days"])).strftime("%d/%m/%Y")
+        for row in project_rows:
+            project_id = int(row[0])
+            if project_id in open_project_ids:
+                continue
+            last_dt = latest_activity.get(project_id) or _parse_crm_datetime(row[4])
+            if not last_dt or (today - last_dt.date()).days < settings["stalled_days"]:
+                continue
+            reference = last_dt.strftime("%Y-%m-%d")
+            automation_key = f"STALLED:{project_id}:{reference}"
+            priority = str(row[3] or default_priority)
+            if priority not in AGENT_PRIORITIES:
+                priority = default_priority
+            candidates.append({
+                "rule": "Dự án chưa chăm sóc", "automation_key": automation_key,
+                "action_type": "CREATE_ACTIVITY",
+                "summary": f"Tạo follow-up cho dự án {row[1]}",
+                "detail": f"Chưa có hoạt động mới từ {last_dt.strftime('%d/%m/%Y')}",
+                "payload": {
+                    "project_id": project_id, "activity_type": "Follow-up",
+                    "content": f"Liên hệ và cập nhật tiến độ dự án {row[1]}",
+                    "due_date": follow_due, "priority": priority,
+                    "note": "Đề xuất tự động vì dự án chưa có Activity đang mở.",
+                },
+                "already_processed": _automation_key_exists(automation_key),
+            })
+
+    if settings["quote_followup_enabled"]:
+        quote_rows = cursor.execute("""
+            SELECT b.id, b.so_bao_gia, b.cong_trinh_id, b.ten_du_an_snapshot,
+                   b.ngay_bao_gia, b.ngay_tao, b.ngay_cap_nhat
+            FROM bao_gia b
+            WHERE b.trang_thai='Đã gửi' AND b.cong_trinh_id IS NOT NULL
+            ORDER BY b.id
+        """).fetchall()
+        follow_due = (today + timedelta(days=settings["followup_offset_days"])).strftime("%d/%m/%Y")
+        for row in quote_rows:
+            quote_dt = (
+                _parse_crm_datetime(row[6]) or _parse_crm_datetime(row[5])
+                or _parse_crm_datetime(row[4])
+            )
+            if not quote_dt or (today - quote_dt.date()).days < settings["quote_followup_days"]:
+                continue
+            quote_no = str(row[1] or "")
+            has_open_followup = cursor.execute("""
+                SELECT 1 FROM cong_trinh_hoat_dong
+                WHERE cong_trinh_id=? AND trang_thai='Đang làm'
+                  AND (noi_dung LIKE ? OR ghi_chu LIKE ?)
+                LIMIT 1
+            """, (int(row[2]), f"%{quote_no}%", f"%{quote_no}%")).fetchone()
+            if has_open_followup:
+                continue
+            automation_key = f"QUOTE_FOLLOWUP:{int(row[0])}:{quote_dt.strftime('%Y-%m-%d')}"
+            candidates.append({
+                "rule": "Follow-up báo giá", "automation_key": automation_key,
+                "action_type": "CREATE_ACTIVITY",
+                "summary": f"Follow-up báo giá {quote_no}",
+                "detail": f"{row[3]} — đã gửi từ {quote_dt.strftime('%d/%m/%Y')}",
+                "payload": {
+                    "project_id": int(row[2]), "activity_type": "Call",
+                    "content": f"Gọi khách follow-up báo giá {quote_no}",
+                    "due_date": follow_due, "priority": default_priority,
+                    "note": "Đề xuất tự động sau khi báo giá đã gửi quá ngưỡng cài đặt.",
+                },
+                "already_processed": _automation_key_exists(automation_key),
+            })
+    # Nếu cùng một dự án vừa bị "đứng" vừa có báo giá cần chăm sóc,
+    # ưu tiên đề xuất cụ thể theo báo giá và bỏ đề xuất follow-up chung.
+    quote_project_ids = {
+        int(item["payload"]["project_id"])
+        for item in candidates if item["rule"] == "Follow-up báo giá"
+    }
+    if quote_project_ids:
+        candidates = [
+            item for item in candidates
+            if not (
+                item["rule"] == "Dự án chưa chăm sóc"
+                and int(item["payload"]["project_id"]) in quote_project_ids
+            )
+        ]
+    return candidates
+
+
+def run_agent_automation_scan(trigger_type="Manual", today=None):
+    """Quét và đưa đề xuất mới vào Agent Control; không thực thi trực tiếp."""
+    today = today or datetime.now().date()
+    now_text = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    try:
+        candidates = get_agent_automation_candidates(today)
+        queued = []
+        skipped = 0
+        for item in candidates:
+            if item["already_processed"]:
+                skipped += 1
+                continue
+            action_uuid = queue_agent_action(
+                item["action_type"], item["payload"], item["summary"],
+                "Agent Automation B5", item["automation_key"]
+            )
+            queued.append(action_uuid)
+        cursor.execute("""
+            UPDATE agent_automation_settings
+            SET last_scan_date=?, last_scan_at=? WHERE id=1
+        """, (today.strftime("%Y-%m-%d"), now_text))
+        detail = {
+            "rules": {
+                name: sum(1 for item in candidates if item["rule"] == name)
+                for name in sorted({item["rule"] for item in candidates})
+            },
+            "queued_action_uuids": queued,
+        }
+        cursor.execute("""
+            INSERT INTO agent_automation_runs
+            (trigger_type, status, candidates_count, queued_count, skipped_count,
+             detail_json, created_at)
+            VALUES (?, 'Hoàn thành', ?, ?, ?, ?, ?)
+        """, (
+            str(trigger_type), len(candidates), len(queued), skipped,
+            json.dumps(detail, ensure_ascii=False, sort_keys=True), now_text,
+        ))
+        conn.commit()
+        return {
+            "candidates": len(candidates), "queued": len(queued),
+            "skipped": skipped, "items": candidates,
+        }
+    except Exception as exc:
+        conn.rollback()
+        cursor.execute("""
+            INSERT INTO agent_automation_runs
+            (trigger_type, status, error_message, created_at)
+            VALUES (?, 'Lỗi', ?, ?)
+        """, (str(trigger_type), str(exc)[:1000], now_text))
+        conn.commit()
+        raise
+
+
+def maybe_run_daily_agent_automation(today=None):
+    today = today or datetime.now().date()
+    settings = get_agent_automation_settings()
+    if not settings["enabled"] or settings["last_scan_date"] == today.strftime("%Y-%m-%d"):
+        return None
+    return run_agent_automation_scan("Tự động hàng ngày", today)
 
 
 # ============================================================
@@ -2131,6 +2479,15 @@ try:
 except Exception as backup_error:
     DAILY_BACKUP_ERROR = str(backup_error)
 
+# B5 chỉ quét một lần mỗi ngày khi người dùng chủ động bật Automation.
+# Kết quả luôn vào hàng chờ; tuyệt đối không thực thi thay đổi tại đây.
+AUTOMATION_ERROR = ""
+AUTOMATION_DAILY_RESULT = None
+try:
+    AUTOMATION_DAILY_RESULT = maybe_run_daily_agent_automation()
+except Exception as automation_error:
+    AUTOMATION_ERROR = str(automation_error)
+
 
 # ============================================================
 # 5. GIAO DIỆN - MODERN BUSINESS CRM
@@ -2319,7 +2676,7 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section">MENU CHÍNH</div>', unsafe_allow_html=True)
     page = st.radio(
         "Điều hướng",
-        ["⌂  Home", "◎  Deals", "✓  Activities", "🧾  Quotations", "♙  Customers", "▦  Products", "🤖  AI Agent", "🛡  Agent Control", "⚙  Settings"],
+        ["⌂  Home", "◎  Deals", "✓  Activities", "🧾  Quotations", "♙  Customers", "▦  Products", "🤖  AI Agent", "⚡  Automation", "🛡  Agent Control", "⚙  Settings"],
         label_visibility="collapsed",
         key="main_navigation"
     )
@@ -2425,6 +2782,12 @@ with st.sidebar:
             ).fetchone()[0] or 0
         )
         st.caption(f"Agent Safety Engine: sẵn sàng • {pending_actions} hành động chờ duyệt")
+        if AUTOMATION_ERROR:
+            st.warning(f"Agent Automation chưa quét được: {AUTOMATION_ERROR}")
+        elif AUTOMATION_DAILY_RESULT and AUTOMATION_DAILY_RESULT.get("queued", 0):
+            st.success(
+                f"Automation vừa tạo {AUTOMATION_DAILY_RESULT['queued']} đề xuất mới để bạn duyệt."
+            )
     st.caption("SQLite local • Dữ liệu & ảnh không bị ghi đè")
 
 
@@ -2444,6 +2807,7 @@ page_alias = {
     "♙  Customers": "👥  Khách hàng",
     "▦  Products": "📦  Sản phẩm",
     "🤖  AI Agent": "🤖  AI Agent",
+    "⚡  Automation": "⚡  Agent Automation",
     "🛡  Agent Control": "🛡️  Agent Control",
     "⚙  Settings": "🏢  Thông tin công ty",
 }
@@ -4620,6 +4984,192 @@ if page == "🤖  AI Agent":
             chat_show["action_uuid"] = chat_show["action_uuid"].fillna("").astype(str).str[:8]
             chat_show.columns = ["ID", "Yêu cầu", "Chế độ", "Intent", "Mã hành động", "Thời điểm"]
             st.dataframe(chat_show, width="stretch", hide_index=True)
+
+
+# ============================================================
+# B5 - AGENT AUTOMATION CENTER
+# ============================================================
+
+if page == "⚡  Agent Automation":
+    page_header(
+        "Agent Automation",
+        "Tự quét công việc và tạo đề xuất follow-up theo quy tắc bạn cài đặt.",
+        "LIGHTINGSALES AUTOMATION"
+    )
+    st.info(
+        "🔒 Automation chỉ đưa đề xuất vào Agent Control. Không tự dời lịch, "
+        "không tự tạo Activity và không thay đổi dữ liệu khi bạn chưa phê duyệt."
+    )
+
+    automation_settings = get_agent_automation_settings()
+    pending_automation_count = int(cursor.execute("""
+        SELECT COUNT(*) FROM agent_action_queue
+        WHERE status='Chờ duyệt' AND requested_by='Agent Automation B5'
+    """).fetchone()[0] or 0)
+    try:
+        current_candidates = get_agent_automation_candidates()
+        new_candidates = [item for item in current_candidates if not item["already_processed"]]
+    except Exception as candidate_error:
+        current_candidates, new_candidates = [], []
+        st.error(f"Không thể xem trước đề xuất: {candidate_error}")
+
+    auto_kpi1, auto_kpi2, auto_kpi3, auto_kpi4 = st.columns(4)
+    with auto_kpi1:
+        kpi_card(
+            "⚡", "TRẠNG THÁI", "Đang bật" if automation_settings["enabled"] else "Đang tắt",
+            "Quét tối đa một lần mỗi ngày"
+        )
+    with auto_kpi2:
+        kpi_card("🔎", "CẦN XỬ LÝ", len(new_candidates), "Đề xuất mới chưa tạo")
+    with auto_kpi3:
+        kpi_card("⏳", "CHỜ DUYỆT", pending_automation_count, "Đang nằm trong Agent Control")
+    with auto_kpi4:
+        kpi_card(
+            "🕘", "LẦN QUÉT CUỐI", automation_settings["last_scan_date"] or "Chưa quét",
+            automation_settings["last_scan_at"] or "—"
+        )
+
+    settings_tab, preview_tab, history_tab = st.tabs([
+        "⚙️ Cấu hình quy tắc", "👀 Xem trước & chạy", "🕘 Lịch sử quét"
+    ])
+
+    with settings_tab:
+        st.markdown("### Cấu hình lịch tự động")
+        st.caption(
+            "Chỉ khi bật công tắc chính, CRM mới tự quét khi bạn mở ứng dụng. "
+            "Mỗi ngày quét tối đa một lần và chỉ tạo đề xuất chờ duyệt."
+        )
+        with st.form("b5_automation_settings_form"):
+            automation_enabled = st.toggle(
+                "Bật Agent Automation hàng ngày",
+                value=automation_settings["enabled"],
+                key="b5_enabled"
+            )
+            rule1, rule2, rule3 = st.columns(3)
+            with rule1:
+                overdue_enabled = st.checkbox(
+                    "Xử lý việc quá hạn", value=automation_settings["overdue_enabled"],
+                    key="b5_overdue_enabled"
+                )
+                overdue_offset = st.number_input(
+                    "Đề xuất dời tới sau bao nhiêu ngày", min_value=1, max_value=30,
+                    value=automation_settings["overdue_offset_days"], step=1,
+                    key="b5_overdue_offset"
+                )
+                st.caption("Ví dụ chọn 1: việc quá hạn được đề xuất dời sang ngày mai.")
+            with rule2:
+                stalled_enabled = st.checkbox(
+                    "Nhắc dự án chưa chăm sóc", value=automation_settings["stalled_enabled"],
+                    key="b5_stalled_enabled"
+                )
+                stalled_days = st.number_input(
+                    "Không có hoạt động trong bao nhiêu ngày", min_value=1, max_value=365,
+                    value=automation_settings["stalled_days"], step=1,
+                    key="b5_stalled_days"
+                )
+                st.caption("Bỏ qua dự án Hoàn thành, Tạm dừng hoặc đang có Activity mở.")
+            with rule3:
+                quote_followup_enabled = st.checkbox(
+                    "Nhắc follow-up báo giá đã gửi",
+                    value=automation_settings["quote_followup_enabled"],
+                    key="b5_quote_enabled"
+                )
+                quote_followup_days = st.number_input(
+                    "Đã gửi quá bao nhiêu ngày", min_value=1, max_value=365,
+                    value=automation_settings["quote_followup_days"], step=1,
+                    key="b5_quote_days"
+                )
+                st.caption("Bỏ qua nếu báo giá đó đã có Activity follow-up đang mở.")
+
+            common1, common2 = st.columns(2)
+            with common1:
+                followup_offset = st.number_input(
+                    "Activity mới hẹn sau bao nhiêu ngày", min_value=1, max_value=30,
+                    value=automation_settings["followup_offset_days"], step=1,
+                    key="b5_followup_offset"
+                )
+            with common2:
+                default_priority = st.selectbox(
+                    "Ưu tiên mặc định", ["High", "Medium", "Low"],
+                    index=["High", "Medium", "Low"].index(automation_settings["default_priority"])
+                    if automation_settings["default_priority"] in ["High", "Medium", "Low"] else 1,
+                    key="b5_default_priority"
+                )
+            save_automation = st.form_submit_button(
+                "💾 Lưu cấu hình B5", type="primary", use_container_width=True
+            )
+            if save_automation:
+                try:
+                    save_agent_automation_settings({
+                        "enabled": automation_enabled,
+                        "overdue_enabled": overdue_enabled,
+                        "overdue_offset_days": overdue_offset,
+                        "stalled_enabled": stalled_enabled,
+                        "stalled_days": stalled_days,
+                        "quote_followup_enabled": quote_followup_enabled,
+                        "quote_followup_days": quote_followup_days,
+                        "followup_offset_days": followup_offset,
+                        "default_priority": default_priority,
+                    })
+                    st.success("Đã lưu cấu hình Agent Automation.")
+                    st.rerun()
+                except Exception as save_automation_error:
+                    st.error(f"Không lưu được cấu hình: {save_automation_error}")
+
+    with preview_tab:
+        st.markdown("### Các đề xuất theo dữ liệu hiện tại")
+        st.caption("Bạn có thể quét thủ công ngay cả khi lịch tự động đang tắt.")
+        if new_candidates:
+            candidate_df = pd.DataFrame([{
+                "Quy tắc": item["rule"], "Hành động": item["action_type"],
+                "Đề xuất": item["summary"], "Chi tiết": item["detail"],
+            } for item in new_candidates])
+            st.dataframe(candidate_df, width="stretch", hide_index=True)
+        else:
+            st.success("Hiện không có đề xuất mới cần tạo.")
+
+        scan_col, control_col = st.columns([2, 1])
+        with scan_col:
+            if st.button(
+                "⚡ Quét ngay và đưa đề xuất vào Agent Control",
+                type="primary", use_container_width=True, key="b5_manual_scan"
+            ):
+                try:
+                    with st.spinner("Đang quét công việc, dự án và báo giá..."):
+                        scan_result = run_agent_automation_scan("Thủ công")
+                    st.session_state["b5_last_scan_result"] = scan_result
+                    st.success(
+                        f"Đã quét {scan_result['candidates']} trường hợp và tạo "
+                        f"{scan_result['queued']} đề xuất mới."
+                    )
+                    st.rerun()
+                except Exception as scan_error:
+                    st.error(f"Automation chưa thể quét: {scan_error}")
+        with control_col:
+            st.caption("Sau khi quét, mở Agent Control để duyệt hoặc từ chối từng đề xuất.")
+
+        last_scan_result = st.session_state.get("b5_last_scan_result")
+        if last_scan_result:
+            st.info(
+                f"Lần quét gần nhất: {last_scan_result['queued']} đề xuất mới • "
+                f"{last_scan_result['skipped']} trường hợp đã xử lý trước đó."
+            )
+
+    with history_tab:
+        automation_history = pd.read_sql_query("""
+            SELECT id, trigger_type, status, candidates_count,
+                   queued_count, skipped_count, error_message, created_at
+            FROM agent_automation_runs
+            ORDER BY id DESC LIMIT 100
+        """, conn)
+        if automation_history.empty:
+            st.info("Chưa có lần quét Automation nào.")
+        else:
+            automation_history.columns = [
+                "ID", "Nguồn chạy", "Trạng thái", "Phát hiện",
+                "Tạo đề xuất", "Bỏ qua trùng", "Lỗi", "Thời điểm"
+            ]
+            st.dataframe(automation_history, width="stretch", hide_index=True)
 
 
 # ============================================================
