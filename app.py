@@ -41,6 +41,7 @@ def install_package(import_name, pip_name=None):
 
 install_package("streamlit")
 install_package("pandas")
+install_package("openpyxl")
 install_package("streamlit_paste_button", "streamlit-paste-button")
 
 
@@ -61,7 +62,7 @@ COMPANY_ASSET_DIR = os.path.join(BASE_DIR, "company_assets")
 os.makedirs(COMPANY_ASSET_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.6.0"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -411,6 +412,11 @@ VALUES (3400, 'B1 backup/restore + B2 safe Agent tool layer', ?)
 cursor.execute("""
 INSERT OR IGNORE INTO schema_migrations (version, description, applied_at)
 VALUES (3500, 'B3 Vietnamese AI Agent Chat + preview workflow', ?)
+""", (datetime.now().strftime("%d/%m/%Y %H:%M:%S"),))
+
+cursor.execute("""
+INSERT OR IGNORE INTO schema_migrations (version, description, applied_at)
+VALUES (3600, 'B4 AI quotation builder + Excel exact SKU validation', ?)
 """, (datetime.now().strftime("%d/%m/%Y %H:%M:%S"),))
 
 conn.commit()
@@ -1066,7 +1072,7 @@ def _execute_agent_tool(action_type, payload):
             product_id = _require_positive_id(line.get("product_id"), f"product_id dòng {index}")
             product_code = _clean_text(line.get("product_code"), f"mã sản phẩm dòng {index}", required=True, max_length=200)
             product = cursor.execute("""
-                SELECT id, ma_code, ten_sp, hang, mo_ta, dvt
+                SELECT id, ma_code, ten_sp, hang, mo_ta, dvt, gia_ban
                 FROM san_pham WHERE id=? AND ma_code=? COLLATE BINARY
             """, (product_id, product_code)).fetchone()
             if not product:
@@ -1082,6 +1088,13 @@ def _execute_agent_tool(action_type, payload):
                 raise AgentActionError(f"Dòng {index}: số lượng, đơn giá hoặc chiết khấu không hợp lệ.")
             if quantity <= 0 or unit_price < 0 or not 0 <= discount <= 100:
                 raise AgentActionError(f"Dòng {index}: giá trị số nằm ngoài phạm vi cho phép.")
+            price_source = str(line.get("price_source") or "FILE").upper()
+            if price_source not in {"CRM", "FILE"}:
+                raise AgentActionError(f"Dòng {index}: nguồn giá không hợp lệ.")
+            if price_source == "CRM" and abs(unit_price - float(product[6] or 0)) > 0.5:
+                raise AgentActionError(
+                    f"Dòng {index}: giá CRM đã thay đổi sau khi tạo bản xem trước; hãy đối chiếu lại."
+                )
             amount = quantity * unit_price * (1 - discount / 100)
             verified_lines.append({
                 "product": product, "sku": sku, "quantity": quantity,
@@ -1189,6 +1202,266 @@ def get_agent_queue(status="Chờ duyệt", limit=100):
 
 
 # ============================================================
+# B4 - NHẬP, ĐỐI CHIẾU VÀ XEM TRƯỚC BÁO GIÁ
+# ============================================================
+
+QUOTE_COLUMN_ALIASES = {
+    "product_code": {
+        "sku", "ma sku", "ma san pham", "ma sp", "ma hang", "product code",
+        "item code", "code", "model"
+    },
+    "quantity": {"so luong", "sl", "qty", "quantity"},
+    "unit_price": {"don gia", "gia", "gia ban", "unit price", "price"},
+    "discount_percent": {
+        "chiet khau", "chiet khau %", "% chiet khau", "discount", "discount %"
+    },
+    "description": {"mo ta", "dien giai", "description", "ten san pham", "ten sp"},
+    "note": {"ghi chu", "note", "notes"},
+}
+
+
+def _quote_column_key(value):
+    normalized = _normalize_vietnamese(value)
+    normalized = re.sub(r"[^a-z0-9%]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _guess_quote_columns(columns):
+    result = {}
+    normalized_columns = {str(col): _quote_column_key(col) for col in columns}
+    for target, aliases in QUOTE_COLUMN_ALIASES.items():
+        matches = [
+            original for original, normalized in normalized_columns.items()
+            if normalized in aliases or any(
+                len(alias) >= 3 and re.search(rf"\b{re.escape(alias)}\b", normalized)
+                for alias in aliases
+            )
+        ]
+        if matches:
+            result[target] = matches[0]
+    return result
+
+
+def _detect_quote_header_row(raw_df, max_rows=40):
+    """Tìm dòng tiêu đề có cả cột mã hàng và số lượng trong file báo giá thực tế."""
+    for row_index in range(min(len(raw_df.index), max_rows)):
+        row_values = [_quote_column_key(value) for value in raw_df.iloc[row_index].tolist()]
+        has_code = any(
+            value in QUOTE_COLUMN_ALIASES["product_code"] or any(
+                len(alias) >= 3 and re.search(rf"\b{re.escape(alias)}\b", value)
+                for alias in QUOTE_COLUMN_ALIASES["product_code"]
+            ) for value in row_values
+        )
+        has_quantity = any(
+            value in QUOTE_COLUMN_ALIASES["quantity"] or any(
+                len(alias) >= 3 and re.search(rf"\b{re.escape(alias)}\b", value)
+                for alias in QUOTE_COLUMN_ALIASES["quantity"]
+            ) for value in row_values
+        )
+        if has_code and has_quantity:
+            return row_index
+    return 0
+
+
+def read_quote_import_file(file_bytes, file_name, sheet_name=None):
+    """Đọc XLSX/CSV, kể cả mẫu báo giá có tiêu đề nằm dưới nhiều dòng đầu."""
+    if not file_bytes:
+        raise AgentActionError("File báo giá trống.")
+    if len(file_bytes) > 25 * 1024 * 1024:
+        raise AgentActionError("File vượt quá giới hạn 25 MB.")
+    extension = os.path.splitext(str(file_name or ""))[1].lower()
+    buffer = io.BytesIO(file_bytes)
+    if extension == ".xlsx":
+        excel_file = pd.ExcelFile(buffer, engine="openpyxl")
+        available_sheets = list(excel_file.sheet_names)
+        if not available_sheets:
+            raise AgentActionError("File Excel không có sheet dữ liệu.")
+        selected_sheet = sheet_name if sheet_name in available_sheets else available_sheets[0]
+        raw_df = pd.read_excel(excel_file, sheet_name=selected_sheet, header=None, dtype=object)
+        header_row = _detect_quote_header_row(raw_df)
+        buffer.seek(0)
+        data_df = pd.read_excel(
+            buffer, sheet_name=selected_sheet, header=header_row, dtype=object, engine="openpyxl"
+        )
+        return data_df, available_sheets, selected_sheet, header_row + 1
+    if extension == ".csv":
+        decode_error = None
+        text_data = None
+        for encoding in ("utf-8-sig", "utf-8", "cp1258", "latin1"):
+            try:
+                text_data = file_bytes.decode(encoding)
+                break
+            except UnicodeDecodeError as exc:
+                decode_error = exc
+        if text_data is None:
+            raise AgentActionError(f"Không đọc được mã hóa CSV: {decode_error}")
+        raw_df = pd.read_csv(io.StringIO(text_data), header=None, dtype=object, sep=None, engine="python")
+        header_row = _detect_quote_header_row(raw_df)
+        data_df = pd.read_csv(
+            io.StringIO(text_data), header=header_row, dtype=object, sep=None, engine="python"
+        )
+        return data_df, ["CSV"], "CSV", header_row + 1
+    raise AgentActionError("Chỉ hỗ trợ file .xlsx hoặc .csv.")
+
+
+def _quote_number(value, field_name, row_number, required=True):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        if required:
+            raise AgentActionError(f"Dòng {row_number}: thiếu {field_name}.")
+        return 0.0
+    text_value = str(value).strip()
+    if not text_value:
+        if required:
+            raise AgentActionError(f"Dòng {row_number}: thiếu {field_name}.")
+        return 0.0
+    text_value = text_value.replace("₫", "").replace("VND", "").replace("vnd", "").replace("%", "").strip()
+    # Hỗ trợ 1.250.000, 1,250,000 và số do Excel lưu trực tiếp.
+    if re.fullmatch(r"-?\d{1,3}(?:[.,]\d{3})+", text_value):
+        text_value = text_value.replace(".", "").replace(",", "")
+    elif text_value.count(",") == 1 and "." not in text_value:
+        text_value = text_value.replace(",", ".")
+    else:
+        text_value = text_value.replace(",", "")
+    try:
+        return float(text_value)
+    except (TypeError, ValueError):
+        raise AgentActionError(f"Dòng {row_number}: {field_name} không phải số hợp lệ.")
+
+
+def build_quote_import_preview(
+    data_df, column_map, price_source, default_discount, project_id,
+    quote_date, vat_percent, quote_note=""
+):
+    """Tạo payload đã đối chiếu; chỉ ready khi mọi dòng hợp lệ và SKU khớp tuyệt đối."""
+    project_id = _require_positive_id(project_id, "project_id")
+    project = get_project_customer(project_id)
+    if not project:
+        raise AgentActionError("Không tìm thấy công trình chính xác.")
+    quote_date = _require_date(quote_date, "ngày báo giá")
+    try:
+        vat_percent = float(vat_percent)
+        default_discount = float(default_discount)
+    except (TypeError, ValueError):
+        raise AgentActionError("VAT hoặc chiết khấu mặc định không hợp lệ.")
+    if not 0 <= vat_percent <= 20:
+        raise AgentActionError("VAT phải nằm trong khoảng 0–20%.")
+    if not 0 <= default_discount <= 100:
+        raise AgentActionError("Chiết khấu phải nằm trong khoảng 0–100%.")
+    if not isinstance(data_df, pd.DataFrame) or data_df.empty:
+        raise AgentActionError("Không có dòng sản phẩm để tạo báo giá.")
+    code_column = column_map.get("product_code")
+    quantity_column = column_map.get("quantity")
+    if code_column not in data_df.columns or quantity_column not in data_df.columns:
+        raise AgentActionError("Cần chọn đúng cột SKU/mã sản phẩm và cột số lượng.")
+    if price_source == "Cột đơn giá trong file" and column_map.get("unit_price") not in data_df.columns:
+        raise AgentActionError("Đã chọn giá từ file nhưng chưa chọn cột đơn giá.")
+
+    lines, issues, comparison_rows = [], [], []
+    for position, (_, row) in enumerate(data_df.iterrows(), start=2):
+        raw_code = row.get(code_column)
+        code = "" if pd.isna(raw_code) else str(raw_code).strip()
+        raw_quantity = row.get(quantity_column)
+        if not code and (raw_quantity is None or pd.isna(raw_quantity) or not str(raw_quantity).strip()):
+            continue
+        if not code:
+            issues.append(f"Dòng {position}: thiếu SKU/mã sản phẩm.")
+            continue
+        product_rows = agent_find_product_exact(code)
+        if len(product_rows.index) != 1:
+            issues.append(f"Dòng {position}: không tìm thấy SKU khớp tuyệt đối “{code}”.")
+            continue
+        product = product_rows.iloc[0]
+        try:
+            quantity = _quote_number(raw_quantity, "số lượng", position)
+            if quantity <= 0:
+                raise AgentActionError(f"Dòng {position}: số lượng phải lớn hơn 0.")
+            crm_price = float(product.get("gia_ban") or 0)
+            file_price = None
+            if column_map.get("unit_price") in data_df.columns:
+                raw_file_price = row.get(column_map["unit_price"])
+                if raw_file_price is not None and not pd.isna(raw_file_price) and str(raw_file_price).strip():
+                    file_price = _quote_number(raw_file_price, "đơn giá", position)
+            if price_source == "Cột đơn giá trong file":
+                if file_price is None:
+                    raise AgentActionError(f"Dòng {position}: thiếu đơn giá trong file.")
+                unit_price = file_price
+                # Giá sau chiết khấu trong Excel được giữ nguyên, không giảm lần hai.
+                discount = 0.0
+            else:
+                if crm_price <= 0:
+                    raise AgentActionError(f"Dòng {position}: sản phẩm chưa có giá bán hợp lệ trong CRM.")
+                unit_price = crm_price
+                if column_map.get("discount_percent") in data_df.columns:
+                    raw_discount = row.get(column_map["discount_percent"])
+                    discount = (
+                        default_discount if raw_discount is None or pd.isna(raw_discount) or not str(raw_discount).strip()
+                        else _quote_number(raw_discount, "chiết khấu", position, required=False)
+                    )
+                else:
+                    discount = default_discount
+            if not 0 <= discount <= 100:
+                raise AgentActionError(f"Dòng {position}: chiết khấu ngoài khoảng 0–100%.")
+        except AgentActionError as exc:
+            issues.append(str(exc))
+            continue
+
+        description_column = column_map.get("description")
+        note_column = column_map.get("note")
+        raw_description = row.get(description_column) if description_column in data_df.columns else ""
+        raw_note = row.get(note_column) if note_column in data_df.columns else ""
+        description = "" if pd.isna(raw_description) else str(raw_description or "").strip()
+        line_note = "" if pd.isna(raw_note) else str(raw_note or "").strip()
+        amount = quantity * unit_price * (1 - discount / 100)
+        lines.append({
+            "product_id": int(product["id"]),
+            "product_code": str(product["ma_code"]),
+            "sku": code,
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "discount_percent": discount,
+            "price_source": "FILE" if price_source == "Cột đơn giá trong file" else "CRM",
+            "description": description or str(product.get("mo_ta") or ""),
+            "note": line_note,
+        })
+        comparison_rows.append({
+            "SKU": code,
+            "Tên sản phẩm": str(product["ten_sp"]),
+            "SL": quantity,
+            "Giá CRM": crm_price,
+            "Giá file": file_price,
+            "Đơn giá dùng": unit_price,
+            "CK %": discount,
+            "Thành tiền": amount,
+            "Đối chiếu": (
+                "Khác giá CRM" if file_price is not None and abs(file_price - crm_price) > 0.5
+                else "Khớp SKU"
+            ),
+        })
+
+    if not lines and not issues:
+        issues.append("File không có dòng sản phẩm hợp lệ.")
+    subtotal = sum(line["quantity"] * line["unit_price"] * (1 - line["discount_percent"] / 100) for line in lines)
+    vat_amount = subtotal * vat_percent / 100
+    payload = {
+        "project_id": project_id,
+        "quote_date": quote_date,
+        "vat_percent": vat_percent,
+        "note": _clean_text(quote_note, "ghi chú báo giá"),
+        "lines": lines,
+    }
+    return {
+        "ready": bool(lines) and not issues,
+        "project_name": str(project[1] or ""),
+        "payload": payload,
+        "issues": issues,
+        "comparison": pd.DataFrame(comparison_rows),
+        "subtotal": subtotal,
+        "vat_amount": vat_amount,
+        "grand_total": subtotal + vat_amount,
+    }
+
+
+# ============================================================
 # B3 - HIỂU LỆNH TIẾNG VIỆT VÀ TẠO ĐỀ XUẤT CHO AGENT CONTROL
 # ============================================================
 
@@ -1248,6 +1521,13 @@ def _parse_vietnamese_command_date(command, today=None):
 
 def _resolve_project_from_command(command):
     normalized = _normalize_vietnamese(command)
+    id_match = re.search(r"(?:cong trinh|du an|project)\s*#?\s*(\d+)\b", normalized)
+    if id_match:
+        row = cursor.execute("""
+            SELECT id, ten_du_an, giai_doan, uu_tien
+            FROM cong_trinh_new WHERE id=?
+        """, (int(id_match.group(1)),)).fetchone()
+        return row, [] if row else []
     projects = cursor.execute("""
         SELECT id, ten_du_an, giai_doan, uu_tien
         FROM cong_trinh_new
@@ -1259,13 +1539,6 @@ def _resolve_project_from_command(command):
         if project_name and project_name in normalized:
             matches.append(row)
     if not matches:
-        id_match = re.search(r"(?:cong trinh|du an|project)\s*#?\s*(\d+)\b", normalized)
-        if id_match:
-            row = cursor.execute("""
-                SELECT id, ten_du_an, giai_doan, uu_tien
-                FROM cong_trinh_new WHERE id=?
-            """, (int(id_match.group(1)),)).fetchone()
-            return row, [] if row else []
         return None, []
 
     longest_length = len(_normalize_vietnamese(matches[0][1]))
@@ -1316,9 +1589,94 @@ def interpret_command_locally(command, today=None):
         "payload": {
             "project_id": None, "activity_id": None, "activity_type": None,
             "content": None, "due_date": None, "priority": None,
-            "note": None, "stage": None,
+            "note": None, "stage": None, "quote_date": None,
+            "vat_percent": None, "lines": [],
         },
     }
+
+    is_quote = any(word in normalized for word in (
+        "tao bao gia", "lap bao gia", "bao gia nhap"
+    ))
+    if is_quote:
+        base["intent"] = "CREATE_QUOTE_DRAFT"
+        project, matches = _resolve_project_from_command(original)
+        if project is None:
+            base["clarification_question"] = (
+                "Có nhiều công trình phù hợp. Hãy chọn công trình trong mục Hỗ trợ nhận diện."
+                if matches else
+                "Không tìm thấy đúng công trình. Hãy chọn công trình trong mục Hỗ trợ nhận diện."
+            )
+            return base
+        quote_date = _parse_vietnamese_command_date(original, today)
+        if not quote_date:
+            base["payload"]["project_id"] = int(project[0])
+            base["clarification_question"] = "Hãy ghi rõ ngày báo giá, ví dụ: ngày hôm nay hoặc 10/09/2026."
+            return base
+        vat_match = re.search(r"\bvat\s*([0-9]+(?:[.,][0-9]+)?)\s*%?", normalized)
+        if not vat_match:
+            base["payload"].update({"project_id": int(project[0]), "quote_date": quote_date})
+            base["clarification_question"] = "Hãy ghi rõ VAT, ví dụ VAT 0% hoặc VAT 10%."
+            return base
+        vat_percent = float(vat_match.group(1).replace(",", "."))
+        discount_match = re.search(r"(?:chiet khau|ck)\s*([0-9]+(?:[.,][0-9]+)?)\s*%?", normalized)
+        no_discount = "khong chiet khau" in normalized
+        if not discount_match and not no_discount:
+            base["payload"].update({
+                "project_id": int(project[0]), "quote_date": quote_date,
+                "vat_percent": vat_percent,
+            })
+            base["clarification_question"] = (
+                "Hãy ghi rõ chiết khấu, ví dụ: chiết khấu 5% hoặc không chiết khấu."
+            )
+            return base
+        discount = float(discount_match.group(1).replace(",", ".")) if discount_match else 0.0
+        line_pattern = re.compile(
+            r"([0-9]+(?:[.,][0-9]+)?)\s*(?:x|cái|cai|bộ|bo|mét|met|m)?\s*"
+            r"(?:mã|ma|sku)\s*([a-z0-9._/-]+)\s*(?:giá|gia|đơn\s*giá|don\s*gia)\s*"
+            r"([0-9](?:[0-9.,]*[0-9])?)",
+            re.IGNORECASE,
+        )
+        parsed_lines = []
+        missing_codes = []
+        for match in line_pattern.finditer(original):
+            quantity = _quote_number(match.group(1), "số lượng", len(parsed_lines) + 1)
+            typed_code = match.group(2).strip()
+            unit_price = _quote_number(match.group(3), "đơn giá", len(parsed_lines) + 1)
+            product_rows = agent_find_product_exact(typed_code)
+            if len(product_rows.index) != 1:
+                missing_codes.append(typed_code)
+                continue
+            product = product_rows.iloc[0]
+            parsed_lines.append({
+                "product_id": int(product["id"]), "product_code": str(product["ma_code"]),
+                "sku": typed_code, "quantity": quantity, "unit_price": unit_price,
+                "discount_percent": discount, "price_source": "FILE",
+                "description": str(product.get("mo_ta") or ""),
+                "note": "",
+            })
+        if missing_codes:
+            base["clarification_question"] = (
+                "Không tìm thấy SKU khớp tuyệt đối: " + ", ".join(missing_codes) + "."
+            )
+            return base
+        if not parsed_lines:
+            base["clarification_question"] = (
+                "Chưa đọc được sản phẩm. Dùng mẫu: 20 mã ABC giá 150000, hoặc tải Excel ở phần Tạo báo giá Agent."
+            )
+            return base
+        base.update({
+            "confidence": 0.9,
+            "summary": f"Tạo báo giá nháp cho {project[1]} với {len(parsed_lines)} sản phẩm",
+            "explanation": "Đã khớp chính xác công trình, SKU và đọc giá trực tiếp từ câu lệnh.",
+            "needs_clarification": False,
+            "clarification_question": "",
+        })
+        base["payload"].update({
+            "project_id": int(project[0]), "quote_date": quote_date,
+            "vat_percent": vat_percent, "lines": parsed_lines,
+            "note": "Tạo từ Vietnamese AI Agent",
+        })
+        return base
 
     is_complete = any(word in normalized for word in (
         "hoan thanh", "da thuc hien", "lam xong", "done"
@@ -1473,7 +1831,13 @@ def _crm_context_for_ai():
             ORDER BY a.id DESC LIMIT 100
         """).fetchall()
     ]
-    return {"projects": projects, "open_activities": activities}
+    products = [
+        {"id": int(row[0]), "code": str(row[1] or ""), "name": str(row[2] or "")}
+        for row in cursor.execute("""
+            SELECT id, ma_code, ten_sp FROM san_pham ORDER BY id DESC LIMIT 500
+        """).fetchall()
+    ]
+    return {"projects": projects, "open_activities": activities, "products": products}
 
 
 def _nullable_schema(json_type):
@@ -1491,7 +1855,7 @@ def interpret_command_with_openai(command, api_key, model="gpt-5-mini"):
         "properties": {
             "intent": {"type": "string", "enum": [
                 "CREATE_ACTIVITY", "RESCHEDULE_ACTIVITY", "COMPLETE_ACTIVITY",
-                "UPDATE_PROJECT_STAGE", "NONE"
+                "UPDATE_PROJECT_STAGE", "CREATE_QUOTE_DRAFT", "NONE"
             ]},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "summary": {"type": "string"},
@@ -1509,10 +1873,35 @@ def interpret_command_with_openai(command, api_key, model="gpt-5-mini"):
                     "priority": _nullable_schema("string"),
                     "note": _nullable_schema("string"),
                     "stage": _nullable_schema("string"),
+                    "quote_date": _nullable_schema("string"),
+                    "vat_percent": _nullable_schema("number"),
+                    "lines": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "product_id": {"type": "integer"},
+                                "product_code": {"type": "string"},
+                                "sku": {"type": "string"},
+                                "quantity": {"type": "number"},
+                                "unit_price": {"type": "number"},
+                                "discount_percent": {"type": "number"},
+                                "price_source": {"type": "string", "enum": ["CRM", "FILE"]},
+                                "description": {"type": "string"},
+                                "note": {"type": "string"},
+                            },
+                            "required": [
+                                "product_id", "product_code", "sku", "quantity", "unit_price",
+                                "discount_percent", "price_source", "description", "note"
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
                 },
                 "required": [
                     "project_id", "activity_id", "activity_type", "content",
-                    "due_date", "priority", "note", "stage"
+                    "due_date", "priority", "note", "stage", "quote_date",
+                    "vat_percent", "lines"
                 ],
                 "additionalProperties": False,
             },
@@ -1528,6 +1917,9 @@ def interpret_command_with_openai(command, api_key, model="gpt-5-mini"):
         "Chỉ chọn một intent trong schema. Chỉ dùng ID có trong CRM_CONTEXT; "
         "không đoán, không dùng tên gần giống, không tự tạo dữ liệu thiếu. "
         "Nếu không xác định duy nhất công trình hoặc Activity, đặt needs_clarification=true. "
+        "Với CREATE_QUOTE_DRAFT: chỉ dùng product_id và product_code khớp tuyệt đối trong context; "
+        "không tự điền VAT, giá, số lượng hoặc chiết khấu. Các giá trị này phải có trong lệnh. "
+        "Đơn giá trong câu lệnh phải có price_source=FILE; không tự dùng giá CRM vì context không chứa giá. "
         "Ngày phải là dd/mm/yyyy. Hôm nay là "
         f"{datetime.now().strftime('%d/%m/%Y')}. "
         "Mọi hành động chỉ là đề xuất và sẽ cần người dùng phê duyệt."
@@ -1594,8 +1986,8 @@ def validate_agent_proposal(proposal):
             proposal.get("clarification_question") or "Agent cần thêm thông tin."
         )
     intent = str(proposal.get("intent") or "NONE").upper()
-    if intent not in AGENT_ALLOWED_ACTIONS or intent == "CREATE_QUOTE_DRAFT":
-        raise AgentActionError("Bước 3 chưa cho phép hành động này.")
+    if intent not in AGENT_ALLOWED_ACTIONS:
+        raise AgentActionError("Hành động này chưa được CRM cho phép.")
     payload = proposal.get("payload")
     if not isinstance(payload, dict):
         raise AgentActionError("Payload đề xuất không hợp lệ.")
@@ -1637,7 +2029,7 @@ def validate_agent_proposal(proposal):
             "activity_id": activity_id,
             "note": _clean_text(payload.get("note"), "ghi chú"),
         }
-    else:
+    elif intent == "UPDATE_PROJECT_STAGE":
         project_id = _require_positive_id(payload.get("project_id"), "project_id")
         if not cursor.execute("SELECT 1 FROM cong_trinh_new WHERE id=?", (project_id,)).fetchone():
             raise AgentActionError("Không tìm thấy chính xác công trình.")
@@ -1645,6 +2037,65 @@ def validate_agent_proposal(proposal):
         if stage not in AGENT_PROJECT_STAGES:
             raise AgentActionError("Giai đoạn không hợp lệ.")
         cleaned_payload = {"project_id": project_id, "stage": stage}
+    else:
+        project_id = _require_positive_id(payload.get("project_id"), "project_id")
+        if not get_project_customer(project_id):
+            raise AgentActionError("Không tìm thấy chính xác công trình.")
+        quote_date = _require_date(payload.get("quote_date"), "ngày báo giá")
+        if "vat_percent" not in payload or payload.get("vat_percent") is None:
+            raise AgentActionError("Thiếu VAT; Agent không được tự đoán VAT.")
+        try:
+            vat_percent = float(payload.get("vat_percent"))
+        except (TypeError, ValueError):
+            raise AgentActionError("VAT không hợp lệ.")
+        if not 0 <= vat_percent <= 20:
+            raise AgentActionError("VAT phải nằm trong khoảng 0–20%.")
+        source_lines = payload.get("lines")
+        if not isinstance(source_lines, list) or not source_lines:
+            raise AgentActionError("Báo giá phải có ít nhất một dòng sản phẩm.")
+        cleaned_lines = []
+        for index, line in enumerate(source_lines, start=1):
+            if not isinstance(line, dict):
+                raise AgentActionError(f"Dòng {index} không hợp lệ.")
+            product_id = _require_positive_id(line.get("product_id"), f"product_id dòng {index}")
+            product_code = _clean_text(
+                line.get("product_code"), f"mã sản phẩm dòng {index}", required=True, max_length=200
+            )
+            product = cursor.execute(
+                "SELECT id FROM san_pham WHERE id=? AND ma_code=? COLLATE BINARY",
+                (product_id, product_code)
+            ).fetchone()
+            if not product:
+                raise AgentActionError(f"Dòng {index}: SKU không khớp chính xác dữ liệu CRM.")
+            try:
+                quantity = float(line.get("quantity"))
+                unit_price = float(line.get("unit_price"))
+                discount = float(line.get("discount_percent", 0))
+            except (TypeError, ValueError):
+                raise AgentActionError(f"Dòng {index}: số lượng, đơn giá hoặc chiết khấu không hợp lệ.")
+            if quantity <= 0 or unit_price < 0 or not 0 <= discount <= 100:
+                raise AgentActionError(f"Dòng {index}: giá trị số nằm ngoài phạm vi cho phép.")
+            price_origin = str(line.get("price_source") or "FILE").upper()
+            if price_origin not in {"CRM", "FILE"}:
+                raise AgentActionError(f"Dòng {index}: nguồn giá không hợp lệ.")
+            cleaned_lines.append({
+                "product_id": product_id,
+                "product_code": product_code,
+                "sku": _clean_text(line.get("sku") or product_code, f"SKU dòng {index}", required=True, max_length=200),
+                "quantity": quantity,
+                "unit_price": unit_price,
+                "discount_percent": discount,
+                "price_source": price_origin,
+                "description": _clean_text(line.get("description"), "mô tả"),
+                "note": _clean_text(line.get("note"), "ghi chú dòng"),
+            })
+        cleaned_payload = {
+            "project_id": project_id,
+            "quote_date": quote_date,
+            "vat_percent": vat_percent,
+            "note": _clean_text(payload.get("note"), "ghi chú báo giá"),
+            "lines": cleaned_lines,
+        }
 
     summary = _clean_text(proposal.get("summary"), "tóm tắt", required=True, max_length=500)
     return intent, cleaned_payload, summary
@@ -3816,15 +4267,16 @@ if page == "🤖  AI Agent":
             else:
                 st.warning("Chưa có API key. Bạn vẫn có thể chuyển sang chế độ Cục bộ.")
             st.caption(
-                "Chế độ API chỉ gửi câu lệnh cùng ID, tên, giai đoạn công trình và Activity đang mở; "
-                "không gửi giá bán, báo giá hoặc số điện thoại khách hàng."
+                "Chế độ API gửi câu lệnh cùng ID/tên công trình, Activity và mã/tên sản phẩm; "
+                "không gửi số điện thoại khách hàng, bảng giá CRM hoặc báo giá đã lưu. "
+                "Nếu câu lệnh có đơn giá, đơn giá đó nằm trong nội dung gửi đi."
             )
         else:
             effective_api_key = ""
             agent_model = ""
             st.caption(
                 "Chế độ cục bộ xử lý các lệnh tạo Activity, dời lịch, hoàn thành Activity "
-                "và đổi giai đoạn mà không cần kết nối AI bên ngoài."
+                "đổi giai đoạn và tạo báo giá theo mẫu lệnh mà không cần kết nối AI bên ngoài."
             )
 
     example_col1, example_col2 = st.columns(2)
@@ -3832,6 +4284,25 @@ if page == "🤖  AI Agent":
         st.caption("Ví dụ: Tạo việc gọi khách cho dự án Villa Thảo Điền vào thứ Sáu, ưu tiên cao.")
     with example_col2:
         st.caption("Ví dụ: Chuyển dự án Showroom Quận 1 sang giai đoạn Báo giá.")
+    st.caption(
+        "Ví dụ báo giá: Tạo báo giá cho dự án #12 ngày hôm nay: "
+        "20 mã DL-01 giá 150.000, VAT 10%, không chiết khấu."
+    )
+
+    project_assist_id = None
+    if not df_ct.empty:
+        with st.expander("🎯 Hỗ trợ nhận diện đúng công trình", expanded=False):
+            project_options = [None] + df_ct["id"].astype(int).tolist()
+            project_assist_id = st.selectbox(
+                "Chọn công trình nếu không muốn gõ chính xác tên",
+                project_options,
+                format_func=lambda value: (
+                    "— Không chọn —" if value is None else
+                    f"#{value} - {df_ct.loc[df_ct['id']==value, 'ten_du_an'].iloc[0]}"
+                ),
+                key="agent_project_assist_id"
+            )
+            st.caption("Công trình được chọn sẽ được gắn bằng ID; Agent không phải đoán theo tên gần giống.")
 
     agent_command = st.text_area(
         "Bạn muốn Agent làm gì?",
@@ -3870,13 +4341,16 @@ if page == "🤖  AI Agent":
         else:
             try:
                 with st.spinner("Agent đang đọc yêu cầu và đối chiếu CRM..."):
+                    command_for_agent = agent_command.strip()
+                    if project_assist_id is not None:
+                        command_for_agent += f" | dự án #{int(project_assist_id)}"
                     if agent_mode.startswith("OpenAI"):
                         proposal = interpret_command_with_openai(
-                            agent_command, effective_api_key, agent_model
+                            command_for_agent, effective_api_key, agent_model
                         )
                         saved_mode = f"OpenAI API / {agent_model}"
                     else:
-                        proposal = interpret_command_locally(agent_command)
+                        proposal = interpret_command_locally(command_for_agent)
                         saved_mode = "Local"
                     chat_id = save_agent_chat(agent_command, proposal, saved_mode)
                 st.session_state["agent_last_proposal"] = proposal
@@ -3942,6 +4416,195 @@ if page == "🤖  AI Agent":
                     st.rerun()
             except Exception as validation_error:
                 st.error(f"Đề xuất bị chặn bởi lớp an toàn: {validation_error}")
+
+    st.markdown("---")
+    st.markdown("### 🧾 Tạo báo giá bằng Agent")
+    st.caption(
+        "Tải Excel/CSV, chọn đúng cột và nguồn giá. Agent chỉ đối chiếu SKU tuyệt đối, "
+        "tính toán và tạo đề xuất; báo giá chỉ được lưu sau khi bạn duyệt tại Agent Control."
+    )
+
+    if df_ct.empty:
+        st.warning("Chưa có công trình. Hãy tạo công trình trước khi lập báo giá.")
+    elif df_sp.empty:
+        st.warning("Chưa có sản phẩm trong kho. Hãy nhập sản phẩm trước khi lập báo giá.")
+    else:
+        quote_project_ids = df_ct["id"].astype(int).tolist()
+        b4a, b4b, b4c = st.columns([1.6, 1, 1])
+        with b4a:
+            b4_project_id = st.selectbox(
+                "Công trình *", quote_project_ids,
+                format_func=lambda value: f"#{value} - {df_ct.loc[df_ct['id']==value, 'ten_du_an'].iloc[0]}",
+                key="b4_quote_project"
+            )
+        with b4b:
+            b4_quote_date = st.date_input("Ngày báo giá *", value=datetime.now().date(), key="b4_quote_date")
+        with b4c:
+            b4_vat = st.number_input(
+                "VAT (%) *", min_value=0.0, max_value=20.0, value=10.0, step=1.0,
+                key="b4_quote_vat"
+            )
+
+        b4_price_source = st.radio(
+            "Nguồn đơn giá *", ["Giá bán trong CRM", "Cột đơn giá trong file"],
+            horizontal=True, key="b4_price_source",
+            help="Giá từ file được hiểu là đơn giá cuối cùng sau chiết khấu và không bị giảm lần hai."
+        )
+        price_col1, price_col2 = st.columns([1, 2])
+        with price_col1:
+            b4_default_discount = st.number_input(
+                "Chiết khấu mặc định (%)", min_value=0.0, max_value=100.0,
+                value=0.0, step=1.0,
+                disabled=b4_price_source == "Cột đơn giá trong file", key="b4_default_discount"
+            )
+        with price_col2:
+            b4_quote_note = st.text_input(
+                "Ghi chú báo giá", placeholder="Chỉ nhập khi muốn lưu ghi chú vào báo giá nháp.",
+                key="b4_quote_note"
+            )
+
+        b4_upload = st.file_uploader(
+            "Tải danh sách sản phẩm (.xlsx hoặc .csv) *", type=["xlsx", "csv"],
+            key="b4_quote_upload", help="File cần có tối thiểu cột SKU/mã sản phẩm và số lượng."
+        )
+        import_df = None
+        if b4_upload is not None:
+            try:
+                first_df, sheet_names, first_sheet, detected_header = read_quote_import_file(
+                    b4_upload.getvalue(), b4_upload.name
+                )
+                selected_sheet = first_sheet
+                if len(sheet_names) > 1:
+                    selected_sheet = st.selectbox("Chọn sheet dữ liệu", sheet_names, key="b4_quote_sheet")
+                if selected_sheet != first_sheet:
+                    import_df, _, _, detected_header = read_quote_import_file(
+                        b4_upload.getvalue(), b4_upload.name, selected_sheet
+                    )
+                else:
+                    import_df = first_df
+                import_df = import_df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+                import_df.columns = [str(column) for column in import_df.columns]
+                st.caption(f"Đã đọc sheet “{selected_sheet}”; nhận diện tiêu đề tại dòng {detected_header}.")
+            except Exception as import_error:
+                st.error(f"Không đọc được file: {import_error}")
+
+        if isinstance(import_df, pd.DataFrame) and not import_df.empty:
+            columns = [str(column) for column in import_df.columns]
+            guessed = _guess_quote_columns(columns)
+            optional_columns = ["— Không dùng —"] + columns
+            st.markdown("#### Ghép cột trong file")
+            map1, map2, map3 = st.columns(3)
+            with map1:
+                b4_code_col = st.selectbox(
+                    "Cột SKU / mã sản phẩm *", columns,
+                    index=columns.index(guessed["product_code"]) if guessed.get("product_code") in columns else 0,
+                    key="b4_map_code"
+                )
+                b4_qty_col = st.selectbox(
+                    "Cột số lượng *", columns,
+                    index=columns.index(guessed["quantity"]) if guessed.get("quantity") in columns else 0,
+                    key="b4_map_quantity"
+                )
+            with map2:
+                b4_price_col = st.selectbox(
+                    "Cột đơn giá", optional_columns,
+                    index=optional_columns.index(guessed["unit_price"]) if guessed.get("unit_price") in optional_columns else 0,
+                    disabled=b4_price_source != "Cột đơn giá trong file", key="b4_map_price"
+                )
+                b4_discount_col = st.selectbox(
+                    "Cột chiết khấu", optional_columns,
+                    index=optional_columns.index(guessed["discount_percent"]) if guessed.get("discount_percent") in optional_columns else 0,
+                    disabled=b4_price_source == "Cột đơn giá trong file", key="b4_map_discount"
+                )
+            with map3:
+                b4_description_col = st.selectbox(
+                    "Cột mô tả", optional_columns,
+                    index=optional_columns.index(guessed["description"]) if guessed.get("description") in optional_columns else 0,
+                    key="b4_map_description"
+                )
+                b4_note_col = st.selectbox(
+                    "Cột ghi chú", optional_columns,
+                    index=optional_columns.index(guessed["note"]) if guessed.get("note") in optional_columns else 0,
+                    key="b4_map_note"
+                )
+
+            with st.expander("👀 Xem dữ liệu gốc đã đọc", expanded=False):
+                st.dataframe(import_df.head(100), width="stretch", hide_index=True)
+            preview_button_col, reset_button_col = st.columns([2, 1])
+            with preview_button_col:
+                build_b4_preview = st.button(
+                    "🔎 Đối chiếu SKU và tính báo giá", type="primary",
+                    use_container_width=True, key="b4_build_preview"
+                )
+            with reset_button_col:
+                clear_b4_preview = st.button(
+                    "🧹 Xóa bản xem trước", use_container_width=True, key="b4_clear_preview"
+                )
+            if clear_b4_preview:
+                st.session_state.pop("b4_quote_preview", None)
+                st.session_state.pop("b4_quote_action_uuid", None)
+                st.rerun()
+            if build_b4_preview:
+                try:
+                    column_map = {
+                        "product_code": b4_code_col, "quantity": b4_qty_col,
+                        "unit_price": None if b4_price_col == "— Không dùng —" else b4_price_col,
+                        "discount_percent": None if b4_discount_col == "— Không dùng —" else b4_discount_col,
+                        "description": None if b4_description_col == "— Không dùng —" else b4_description_col,
+                        "note": None if b4_note_col == "— Không dùng —" else b4_note_col,
+                    }
+                    b4_preview = build_quote_import_preview(
+                        import_df, column_map, b4_price_source, b4_default_discount,
+                        int(b4_project_id), b4_quote_date.strftime("%d/%m/%Y"),
+                        float(b4_vat), b4_quote_note
+                    )
+                    st.session_state["b4_quote_preview"] = b4_preview
+                    st.session_state.pop("b4_quote_action_uuid", None)
+                except Exception as preview_error:
+                    st.error(f"Không thể tạo bản xem trước: {preview_error}")
+
+        b4_preview = st.session_state.get("b4_quote_preview")
+        if b4_preview:
+            st.markdown("#### Kết quả kiểm tra")
+            if b4_preview.get("issues"):
+                st.error(f"Phát hiện {len(b4_preview['issues'])} lỗi. Agent chưa cho phép chuyển sang phê duyệt.")
+                for issue in b4_preview["issues"][:100]:
+                    st.write(f"• {issue}")
+            comparison_df = b4_preview.get("comparison")
+            if isinstance(comparison_df, pd.DataFrame) and not comparison_df.empty:
+                st.dataframe(comparison_df, width="stretch", hide_index=True)
+            total1, total2, total3 = st.columns(3)
+            with total1:
+                st.metric("Tạm tính", money_vnd(b4_preview.get("subtotal", 0)))
+            with total2:
+                st.metric("Tiền VAT", money_vnd(b4_preview.get("vat_amount", 0)))
+            with total3:
+                st.metric("Tổng thanh toán", money_vnd(b4_preview.get("grand_total", 0)))
+
+            if b4_preview.get("ready"):
+                st.success("Tất cả SKU đã khớp chính xác. Báo giá sẵn sàng chuyển sang Agent Control.")
+                existing_b4_action = st.session_state.get("b4_quote_action_uuid")
+                if existing_b4_action:
+                    st.success(f"Đã chuyển sang Agent Control — mã {existing_b4_action[:8]}.")
+                elif st.button(
+                    "➡️ Đưa báo giá sang Agent Control", type="primary",
+                    use_container_width=True, key="b4_send_to_control"
+                ):
+                    try:
+                        proposal_to_validate = {
+                            "intent": "CREATE_QUOTE_DRAFT", "needs_clarification": False,
+                            "summary": f"Tạo báo giá nháp cho {b4_preview['project_name']}",
+                            "payload": b4_preview["payload"],
+                        }
+                        safe_intent, safe_payload, safe_summary = validate_agent_proposal(proposal_to_validate)
+                        action_uuid = queue_agent_action(
+                            safe_intent, safe_payload, safe_summary, "AI Quotation Builder B4"
+                        )
+                        st.session_state["b4_quote_action_uuid"] = action_uuid
+                        st.success(f"Đã chuyển sang Agent Control — mã {action_uuid[:8]}.")
+                        st.rerun()
+                    except Exception as queue_quote_error:
+                        st.error(f"Báo giá bị lớp an toàn chặn: {queue_quote_error}")
 
     with st.expander("🕘 Lịch sử trao đổi gần đây", expanded=False):
         chat_history_df = pd.read_sql_query("""
@@ -4030,6 +4693,29 @@ if page == "🛡️  Agent Control":
                 try:
                     payload_preview = json.loads(payload_json)
                     st.json(payload_preview)
+                    if action_type == "CREATE_QUOTE_DRAFT":
+                        quote_preview_rows = []
+                        for quote_line in payload_preview.get("lines", []):
+                            quantity = float(quote_line.get("quantity") or 0)
+                            unit_price = float(quote_line.get("unit_price") or 0)
+                            discount = float(quote_line.get("discount_percent") or 0)
+                            quote_preview_rows.append({
+                                "SKU": quote_line.get("sku") or quote_line.get("product_code"),
+                                "Số lượng": quantity,
+                                "Đơn giá": unit_price,
+                                "Chiết khấu %": discount,
+                                "Thành tiền": quantity * unit_price * (1 - discount / 100),
+                            })
+                        quote_preview_df = pd.DataFrame(quote_preview_rows)
+                        if not quote_preview_df.empty:
+                            st.markdown("##### Chi tiết báo giá chờ duyệt")
+                            st.dataframe(quote_preview_df, width="stretch", hide_index=True)
+                            quote_subtotal = float(quote_preview_df["Thành tiền"].sum())
+                            quote_vat = float(payload_preview.get("vat_percent") or 0)
+                            st.info(
+                                f"Tạm tính {money_vnd(quote_subtotal)} • VAT {quote_vat:g}% • "
+                                f"Tổng {money_vnd(quote_subtotal * (1 + quote_vat / 100))}"
+                            )
                 except Exception:
                     st.code(payload_json)
 

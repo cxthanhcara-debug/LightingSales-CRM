@@ -1,6 +1,6 @@
 {
-  "version": "3.5.0",
+  "version": "3.6.0",
   "app_url": "https://raw.githubusercontent.com/cxthanhcara-debug/LightingSales-CRM/main/app.py",
-  "sha256": "a2ab53e24396a5db514ef7f9667df84bd44bb663240f99a2a2c2b7ff0d5d31f9",
-  "notes": "v3.5.0 - Bước 3 Vietnamese AI Agent Chat: thêm màn hình nhập lệnh tiếng Việt, chế độ cục bộ không cần API, chế độ OpenAI API tùy chọn với Structured Outputs, đối chiếu ID công trình/Activity, phát hiện thiếu hoặc trùng dữ liệu, bản xem trước, lịch sử chat và chuyển đề xuất sang Agent Control để người dùng phê duyệt. Không tự thực hiện hoặc tự đoán dữ liệu."
+  "sha256": "67eb35b81ec4fd54abf7ff0d0c961ec974cebeba8e78ad73453bfce513a36096",
+  "notes": "v3.6.0 - Hoàn thành Bước 4 AI Quotation Builder: tạo báo giá nháp bằng lệnh tiếng Việt hoặc file XLSX/CSV; hỗ trợ chọn công trình để tránh nhập sai tên; tự nhận diện dòng tiêu đề và ghép cột; đối chiếu SKU tuyệt đối; chọn rõ nguồn giá CRM hoặc giá trong file; không chiết khấu lần hai khi đơn giá file là giá cuối; cảnh báo thiếu/sai dữ liệu; tính tạm tính, VAT và tổng thanh toán; xem trước chi tiết; chuyển sang Agent Control và chỉ tạo báo giá sau khi người dùng phê duyệt."
 }
