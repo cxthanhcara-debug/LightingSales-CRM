@@ -60,7 +60,7 @@ COMPANY_ASSET_DIR = os.path.join(BASE_DIR, "company_assets")
 os.makedirs(COMPANY_ASSET_DIR, exist_ok=True)
 
 # Phiên bản hiện tại và cấu hình cập nhật tự động
-APP_VERSION = "3.4.0"
+APP_VERSION = "3.4.1"
 UPDATE_CONFIG_FILE = os.path.join(BASE_DIR, "update_config.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -1364,7 +1364,7 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section">MENU CHÍNH</div>', unsafe_allow_html=True)
     page = st.radio(
         "Điều hướng",
-        ["⌂  Home", "◎  Deals", "✓  Activities", "🧾  Quotations", "♙  Customers", "▦  Products", "⚙  Settings"],
+        ["⌂  Home", "◎  Deals", "✓  Activities", "🧾  Quotations", "♙  Customers", "▦  Products", "🛡  Agent Control", "⚙  Settings"],
         label_visibility="collapsed",
         key="main_navigation"
     )
@@ -1488,6 +1488,7 @@ page_alias = {
     "🧾  Quotations": "🧾  Báo giá",
     "♙  Customers": "👥  Khách hàng",
     "▦  Products": "📦  Sản phẩm",
+    "🛡  Agent Control": "🛡️  Agent Control",
     "⚙  Settings": "🏢  Thông tin công ty",
 }
 page = page_alias.get(page, page)
@@ -3264,6 +3265,328 @@ if page == "📦  Sản phẩm":
             sp_del_id=st.selectbox("Chọn sản phẩm cần xóa",df_sp["id"].tolist(),format_func=lambda x:f"{df_sp.loc[df_sp['id']==x,'ma_code'].values[0]} - {df_sp.loc[df_sp['id']==x,'ten_sp'].values[0]}",key="sp_delete_id")
             if st.button("❌ Xác nhận xóa sản phẩm",type="primary",key="delete_product_btn"):
                 cursor.execute("DELETE FROM san_pham WHERE id=?",(sp_del_id,)); conn.commit(); st.success("🎉 Đã xóa sản phẩm!"); st.rerun()
+
+
+# ============================================================
+# B2 - AGENT CONTROL CENTER
+# ============================================================
+
+if page == "🛡️  Agent Control":
+    page_header(
+        "Agent Control Center",
+        "Kiểm soát mọi hành động do AI đề xuất trước khi dữ liệu CRM được thay đổi.",
+        "AI AGENT SAFETY"
+    )
+
+    agent_counts = {
+        row[0]: int(row[1] or 0)
+        for row in cursor.execute("""
+            SELECT status, COUNT(*)
+            FROM agent_action_queue
+            GROUP BY status
+        """).fetchall()
+    }
+    ac1, ac2, ac3, ac4 = st.columns(4)
+    with ac1:
+        kpi_card("⏳", "CHỜ DUYỆT", agent_counts.get("Chờ duyệt", 0), "Chưa thay đổi CRM")
+    with ac2:
+        kpi_card("✓", "ĐÃ THỰC HIỆN", agent_counts.get("Đã thực hiện", 0), "Đã được phê duyệt")
+    with ac3:
+        kpi_card("⊘", "ĐÃ TỪ CHỐI", agent_counts.get("Đã từ chối", 0), "Không tác động dữ liệu")
+    with ac4:
+        kpi_card("!", "THỰC HIỆN LỖI", agent_counts.get("Thực hiện lỗi", 0), "Đã rollback an toàn")
+
+    control_tab, tools_tab, log_tab = st.tabs([
+        "⏳ Hàng chờ phê duyệt",
+        "🧰 Chạy thử công cụ",
+        "🕘 Nhật ký Agent"
+    ])
+
+    with control_tab:
+        st.markdown("### Hành động đang chờ bạn quyết định")
+        st.caption("Agent chỉ đề xuất. CRM chỉ thay đổi sau khi bạn bấm Duyệt và thực hiện.")
+        pending_df = get_agent_queue("Chờ duyệt", 200)
+        if pending_df.empty:
+            st.success("Không có hành động nào đang chờ duyệt.")
+        else:
+            pending_show = pending_df[
+                ["id", "action_type", "summary", "requested_by", "created_at"]
+            ].copy()
+            pending_show.columns = ["ID", "Loại hành động", "Nội dung", "Nguồn", "Thời điểm"]
+            st.dataframe(pending_show, width="stretch", hide_index=True)
+
+            action_uuid_options = pending_df["action_uuid"].tolist()
+            selected_action_uuid = st.selectbox(
+                "Chọn hành động để kiểm tra",
+                action_uuid_options,
+                format_func=lambda x: (
+                    f"#{int(pending_df.loc[pending_df['action_uuid']==x, 'id'].iloc[0])} — "
+                    f"{pending_df.loc[pending_df['action_uuid']==x, 'summary'].iloc[0]}"
+                ),
+                key="agent_pending_select"
+            )
+            selected_action = cursor.execute("""
+                SELECT action_type, payload_json, summary, requested_by, created_at
+                FROM agent_action_queue
+                WHERE action_uuid=? AND status='Chờ duyệt'
+            """, (selected_action_uuid,)).fetchone()
+
+            if selected_action:
+                action_type, payload_json, summary, requested_by, created_at = selected_action
+                st.markdown(f"#### {summary}")
+                st.caption(f"{action_type} • {requested_by} • {created_at}")
+                try:
+                    payload_preview = json.loads(payload_json)
+                    st.json(payload_preview)
+                except Exception:
+                    st.code(payload_json)
+
+                review_note = st.text_area(
+                    "Ghi chú phê duyệt / từ chối",
+                    placeholder="Ví dụ: Đã kiểm tra đúng công trình và ngày hẹn.",
+                    key=f"agent_review_note_{selected_action_uuid}"
+                )
+                approve_col, reject_col = st.columns(2)
+                with approve_col:
+                    if st.button(
+                        "✅ Duyệt và thực hiện",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"agent_approve_{selected_action_uuid}"
+                    ):
+                        try:
+                            result = approve_and_execute_agent_action(
+                                selected_action_uuid, review_note
+                            )
+                            st.success(f"Đã thực hiện an toàn: {result}")
+                            st.rerun()
+                        except Exception as action_error:
+                            st.error(f"Hành động không được thực hiện: {action_error}")
+                with reject_col:
+                    if st.button(
+                        "❌ Từ chối",
+                        use_container_width=True,
+                        key=f"agent_reject_{selected_action_uuid}"
+                    ):
+                        try:
+                            reject_agent_action(selected_action_uuid, review_note)
+                            st.success("Đã từ chối. CRM không bị thay đổi.")
+                            st.rerun()
+                        except Exception as reject_error:
+                            st.error(f"Không thể từ chối: {reject_error}")
+
+    with tools_tab:
+        st.markdown("### Chạy thử quy trình đề xuất → phê duyệt")
+        st.info(
+            "Các form dưới đây chỉ đưa hành động vào hàng chờ. "
+            "Bạn phải sang tab Hàng chờ phê duyệt để kiểm tra và thực hiện."
+        )
+
+        tool_activity, tool_existing, tool_stage = st.tabs([
+            "➕ Tạo Activity",
+            "📅 Xử lý Activity",
+            "🏗️ Đổi giai đoạn"
+        ])
+
+        with tool_activity:
+            if df_ct.empty:
+                st.warning("Chưa có công trình để tạo Activity.")
+            else:
+                with st.form("agent_test_create_activity_form"):
+                    project_ids = df_ct["id"].astype(int).tolist()
+                    test_project_id = st.selectbox(
+                        "Công trình *",
+                        project_ids,
+                        format_func=lambda x: f"#{x} - {df_ct.loc[df_ct['id']==x, 'ten_du_an'].iloc[0]}"
+                    )
+                    ta1, ta2, ta3 = st.columns(3)
+                    with ta1:
+                        test_activity_type = st.selectbox(
+                            "Loại Activity", ["Follow-up", "Call", "Meeting", "Site Survey", "Deadline"]
+                        )
+                    with ta2:
+                        test_activity_date = st.date_input(
+                            "Ngày hẹn *", value=datetime.now().date() + timedelta(days=1)
+                        )
+                    with ta3:
+                        test_activity_priority = st.selectbox(
+                            "Ưu tiên", ["High", "Medium", "Low"], index=1
+                        )
+                    test_activity_content = st.text_area(
+                        "Nội dung công việc *",
+                        placeholder="Ví dụ: Gọi khách xác nhận mẫu đèn và lịch khảo sát."
+                    )
+                    test_activity_note = st.text_area("Ghi chú")
+                    queue_activity_submit = st.form_submit_button(
+                        "Đưa vào hàng chờ", type="primary", use_container_width=True
+                    )
+                    if queue_activity_submit:
+                        try:
+                            action_uuid = queue_agent_action(
+                                "CREATE_ACTIVITY",
+                                {
+                                    "project_id": int(test_project_id),
+                                    "activity_type": test_activity_type,
+                                    "content": test_activity_content,
+                                    "due_date": test_activity_date.strftime("%d/%m/%Y"),
+                                    "priority": test_activity_priority,
+                                    "note": test_activity_note,
+                                },
+                                f"Tạo {test_activity_type} cho {df_ct.loc[df_ct['id']==test_project_id, 'ten_du_an'].iloc[0]}",
+                                "Kiểm thử Bước 2"
+                            )
+                            st.success(f"Đã đưa vào hàng chờ: {action_uuid[:8]}")
+                        except Exception as queue_error:
+                            st.error(f"Không thể tạo đề xuất: {queue_error}")
+
+        with tool_existing:
+            open_activity_df = pd.read_sql_query("""
+                SELECT a.id, a.cong_trinh_id, c.ten_du_an, a.loai,
+                       a.noi_dung, a.ngay_hen, a.uu_tien
+                FROM cong_trinh_hoat_dong a
+                JOIN cong_trinh_new c ON c.id=a.cong_trinh_id
+                WHERE a.trang_thai='Đang làm'
+                ORDER BY a.id DESC
+            """, conn)
+            if open_activity_df.empty:
+                st.info("Không có Activity đang làm.")
+            else:
+                with st.form("agent_test_existing_activity_form"):
+                    open_activity_ids = open_activity_df["id"].astype(int).tolist()
+                    test_activity_id = st.selectbox(
+                        "Activity *",
+                        open_activity_ids,
+                        format_func=lambda x: (
+                            f"#{x} - {open_activity_df.loc[open_activity_df['id']==x, 'ten_du_an'].iloc[0]} | "
+                            f"{open_activity_df.loc[open_activity_df['id']==x, 'noi_dung'].iloc[0]}"
+                        )
+                    )
+                    activity_operation = st.radio(
+                        "Hành động", ["Dời thời hạn", "Đánh dấu hoàn thành"], horizontal=True
+                    )
+                    new_activity_date = st.date_input(
+                        "Ngày hẹn mới",
+                        value=datetime.now().date() + timedelta(days=3),
+                        disabled=activity_operation != "Dời thời hạn"
+                    )
+                    activity_operation_note = st.text_area("Ghi chú xử lý")
+                    queue_existing_submit = st.form_submit_button(
+                        "Đưa vào hàng chờ", type="primary", use_container_width=True
+                    )
+                    if queue_existing_submit:
+                        try:
+                            selected_activity_name = str(
+                                open_activity_df.loc[
+                                    open_activity_df["id"] == test_activity_id, "noi_dung"
+                                ].iloc[0]
+                            )
+                            if activity_operation == "Dời thời hạn":
+                                queued_type = "RESCHEDULE_ACTIVITY"
+                                queued_payload = {
+                                    "activity_id": int(test_activity_id),
+                                    "due_date": new_activity_date.strftime("%d/%m/%Y"),
+                                    "note": activity_operation_note,
+                                }
+                                queued_summary = f"Dời thời hạn: {selected_activity_name}"
+                            else:
+                                queued_type = "COMPLETE_ACTIVITY"
+                                queued_payload = {
+                                    "activity_id": int(test_activity_id),
+                                    "note": activity_operation_note,
+                                }
+                                queued_summary = f"Hoàn thành: {selected_activity_name}"
+                            action_uuid = queue_agent_action(
+                                queued_type, queued_payload, queued_summary, "Kiểm thử Bước 2"
+                            )
+                            st.success(f"Đã đưa vào hàng chờ: {action_uuid[:8]}")
+                        except Exception as queue_error:
+                            st.error(f"Không thể tạo đề xuất: {queue_error}")
+
+        with tool_stage:
+            if df_ct.empty:
+                st.warning("Chưa có công trình để cập nhật giai đoạn.")
+            else:
+                with st.form("agent_test_project_stage_form"):
+                    project_ids = df_ct["id"].astype(int).tolist()
+                    stage_project_id = st.selectbox(
+                        "Công trình *",
+                        project_ids,
+                        format_func=lambda x: f"#{x} - {df_ct.loc[df_ct['id']==x, 'ten_du_an'].iloc[0]}"
+                    )
+                    stage_value = st.selectbox(
+                        "Giai đoạn mới *",
+                        ["Tiếp cận", "Khảo sát", "Báo giá", "Thương lượng", "Chốt đơn", "Triển khai", "Hoàn thành", "Tạm dừng"]
+                    )
+                    queue_stage_submit = st.form_submit_button(
+                        "Đưa vào hàng chờ", type="primary", use_container_width=True
+                    )
+                    if queue_stage_submit:
+                        try:
+                            project_name = str(
+                                df_ct.loc[df_ct["id"] == stage_project_id, "ten_du_an"].iloc[0]
+                            )
+                            action_uuid = queue_agent_action(
+                                "UPDATE_PROJECT_STAGE",
+                                {"project_id": int(stage_project_id), "stage": stage_value},
+                                f"Chuyển {project_name} sang giai đoạn {stage_value}",
+                                "Kiểm thử Bước 2"
+                            )
+                            st.success(f"Đã đưa vào hàng chờ: {action_uuid[:8]}")
+                        except Exception as queue_error:
+                            st.error(f"Không thể tạo đề xuất: {queue_error}")
+
+        st.markdown("### Bộ công cụ đã khóa quyền")
+        tool_status_df = pd.DataFrame([
+            ["CREATE_ACTIVITY", "Tạo Activity", "Bắt buộc duyệt"],
+            ["RESCHEDULE_ACTIVITY", "Dời thời hạn", "Bắt buộc duyệt"],
+            ["COMPLETE_ACTIVITY", "Hoàn thành Activity", "Bắt buộc duyệt"],
+            ["UPDATE_PROJECT_STAGE", "Đổi giai đoạn", "Bắt buộc duyệt"],
+            ["CREATE_QUOTE_DRAFT", "Tạo báo giá nháp", "Bắt buộc duyệt + exact match"],
+        ], columns=["Mã công cụ", "Chức năng", "Kiểm soát"])
+        st.dataframe(tool_status_df, width="stretch", hide_index=True)
+
+    with log_tab:
+        st.markdown("### Nhật ký kiểm toán")
+        st.caption("Lịch sử chỉ đọc: đề xuất, phê duyệt, từ chối, thành công và lỗi.")
+        agent_log_df = pd.read_sql_query("""
+            SELECT id, action_uuid, event_type, action_type, summary, created_at
+            FROM agent_action_log
+            ORDER BY id DESC
+            LIMIT 200
+        """, conn)
+        if agent_log_df.empty:
+            st.info("Chưa có hoạt động Agent nào được ghi nhận.")
+        else:
+            log_show = agent_log_df.copy()
+            log_show["action_uuid"] = log_show["action_uuid"].astype(str).str[:8]
+            log_show.columns = ["ID", "Mã", "Sự kiện", "Loại", "Nội dung", "Thời điểm"]
+            st.dataframe(log_show, width="stretch", hide_index=True)
+
+            with st.expander("🔍 Xem dữ liệu chi tiết của một sự kiện"):
+                log_ids = agent_log_df["id"].astype(int).tolist()
+                selected_log_id = st.selectbox("Chọn ID nhật ký", log_ids, key="agent_log_select")
+                log_detail = cursor.execute("""
+                    SELECT event_type, action_type, summary, payload_json, result_json, created_at
+                    FROM agent_action_log WHERE id=?
+                """, (int(selected_log_id),)).fetchone()
+                if log_detail:
+                    st.caption(
+                        f"{log_detail[0]} • {log_detail[1]} • {log_detail[5]}"
+                    )
+                    st.write(log_detail[2])
+                    detail_left, detail_right = st.columns(2)
+                    with detail_left:
+                        st.markdown("**Dữ liệu đề xuất**")
+                        try:
+                            st.json(json.loads(log_detail[3] or "{}"))
+                        except Exception:
+                            st.code(log_detail[3] or "{}")
+                    with detail_right:
+                        st.markdown("**Kết quả**")
+                        try:
+                            st.json(json.loads(log_detail[4] or "{}"))
+                        except Exception:
+                            st.code(log_detail[4] or "{}")
 
 
 # ============================================================
