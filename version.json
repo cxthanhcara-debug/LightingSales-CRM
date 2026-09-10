@@ -1,6 +1,6 @@
 {
-  "version": "3.3.1",
+  "version": "3.4.0",
   "app_url": "https://raw.githubusercontent.com/cxthanhcara-debug/LightingSales-CRM/main/app.py",
-  "sha256": "d39e08e6f30a920671d9cc80329e11c9da18b574097c42ea9244eba7bf77d7b4",
-  "notes": "v3.3.1 - CRM UX Refactor: Home, Deals, Activities, Quotations, Customers, Products, Settings; Deal Workspace trong Deals; Activity Center; Deal Health; giữ nguyên dữ liệu và Quick Quotation V3.3."
+  "sha256": "815e7747211ac441a69763821c1616886febac9fa83ffe9b6ec29ddd2e89fe58",
+  "notes": "v3.4.0 - B1 bảo vệ dữ liệu: backup tự động và thủ công, kiểm tra integrity, khôi phục có checksum. B2 AI Agent Foundation: lớp công cụ CRM an toàn, hàng chờ phê duyệt, nhật ký hành động, exact-match mã sản phẩm và rollback khi lỗi. Giữ nguyên toàn bộ dữ liệu CRM hiện có."
 }
